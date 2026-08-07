@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lxmf-group-hub"
+version = "0.1.0"
+description = "Headless federated LXMF group messaging hub for the Reticulum Network Stack"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "rns>=0.9.0",
+    "lxmf>=0.6.0",
+    "msgpack>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[project.scripts]
+lxmf-hub = "lxmf_hub.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lxmf_hub*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
