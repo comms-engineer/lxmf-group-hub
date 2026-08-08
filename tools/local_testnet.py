@@ -15,6 +15,9 @@ one hub and watch the message appear on the other::
 
     python tools/local_testnet.py hub --name b --port 4243 --connect 4242 \\
         --group ops --public --peer <hub_a_federation_hash>
+
+Set ``TESTNET_LOGLEVEL=7`` for per-message hub and federation debug output. All
+role output is line-flushed, so redirecting stdout to a log file works.
 """
 
 from __future__ import annotations
@@ -36,6 +39,9 @@ from lxmf_hub.store import ACL_INVITE, ACL_PUBLIC  # noqa: E402
 
 BASE = os.path.expanduser("~/.lxmf_hub_testnet")
 
+# Raise with TESTNET_LOGLEVEL=7 to see per-message hub and federation debug output.
+LOGLEVEL = int(os.environ.get("TESTNET_LOGLEVEL", "4"))
+
 CONFIG_TEMPLATE = """
 [reticulum]
   enable_transport = {transport}
@@ -43,7 +49,7 @@ CONFIG_TEMPLATE = """
   instance_name = {name}
 
 [logging]
-  loglevel = 4
+  loglevel = {loglevel}
 
 [interfaces]
 {interfaces}
@@ -77,7 +83,10 @@ def write_reticulum_config(name: str, port: int | None, connect: list[int], tran
     with open(os.path.join(config_dir, "config"), "w") as config_file:
         config_file.write(
             CONFIG_TEMPLATE.format(
-                name=name, interfaces=interfaces, transport="Yes" if transport else "No"
+                name=name,
+                interfaces=interfaces,
+                transport="Yes" if transport else "No",
+                loglevel=LOGLEVEL,
             )
         )
     return config_dir
@@ -92,6 +101,7 @@ def run_hub(args: argparse.Namespace) -> int:
                 args.name, args.port, args.connect, transport=True
             ),
             "hub_name": f"testnet-{args.name}",
+            "log_level": LOGLEVEL,
             "announce_interval_sec": 20,
             "announce_jitter_sec": 0,
             "egress": {"tokens_per_second": 1.0, "burst": 2, "retry_backoff_sec": 10},
@@ -111,21 +121,24 @@ def run_hub(args: argparse.Namespace) -> int:
         group = daemon.hub.create_group(
             args.group, args.group, ACL_PUBLIC if args.public else ACL_INVITE
         )
-        print(f"group {group.group_id}: {group_destination_hash(group.identity_key).hex()}")
+        print(
+            f"group {group.group_id}: {group_destination_hash(group.identity_key).hex()}",
+            flush=True,
+        )
     for member in args.member:
         daemon.store.add_member(args.group, bytes.fromhex(member))
 
     for group in daemon.store.list_groups():
-        print(f"group {group.group_id}: {group_destination_hash(group.identity_key).hex()}")
-    print(f"federation endpoint: {daemon.federation.destination.hash.hex()}")
-    sys.stdout.flush()
+        print(
+            f"group {group.group_id}: {group_destination_hash(group.identity_key).hex()}",
+            flush=True,
+        )
+    if daemon.federation is not None:
+        print(f"federation endpoint: {daemon.federation.destination.hash.hex()}", flush=True)
 
-    try:
-        while True:
-            daemon.destinations.announce_due()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        daemon.shutdown()
+    # Same supervision loop as the real daemon, so hot-loading and pruning are
+    # exercised by the harness too.
+    daemon.supervise()
     return 0
 
 
@@ -134,7 +147,7 @@ def run_client(args: argparse.Namespace) -> int:
     os.makedirs(storage, exist_ok=True)
     RNS.Reticulum(
         configdir=write_reticulum_config(args.name, None, args.connect, transport=False),
-        loglevel=4,
+        loglevel=LOGLEVEL,
     )
 
     identity_path = os.path.join(storage, "identity")
@@ -148,12 +161,12 @@ def run_client(args: argparse.Namespace) -> int:
     router.register_delivery_callback(
         lambda message: print(
             f"[{args.name}] received: {message.content_as_string()}"
-            f" fields={ {key: value for key, value in (message.fields or {}).items()} }"
+            f" fields={ {key: value for key, value in (message.fields or {}).items()} }",
+            flush=True,
         )
     )
     router.announce(destination.hash)
-    print(f"client {args.name}: {destination.hash.hex()}")
-    sys.stdout.flush()
+    print(f"client {args.name}: {destination.hash.hex()}", flush=True)
 
     if args.send_to:
         group_hash = bytes.fromhex(args.send_to)
@@ -164,7 +177,7 @@ def run_client(args: argparse.Namespace) -> int:
             time.sleep(1)
         group_identity = RNS.Identity.recall(group_hash)
         if group_identity is None:
-            print(f"[{args.name}] no path to group {args.send_to}", file=sys.stderr)
+            print(f"[{args.name}] no path to group {args.send_to}", file=sys.stderr, flush=True)
             return 1
         group_destination = RNS.Destination(
             group_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery"
@@ -174,7 +187,7 @@ def run_client(args: argparse.Namespace) -> int:
         )
         message.desired_method = LXMF.LXMessage.DIRECT
         router.handle_outbound(message)
-        print(f"[{args.name}] sent: {args.message}")
+        print(f"[{args.name}] sent: {args.message}", flush=True)
 
     try:
         while True:

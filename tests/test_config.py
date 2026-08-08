@@ -46,3 +46,13 @@ def test_load_from_file(tmp_path):
 def test_at_rest_keyfile_defaults_into_storage_path():
     config = HubConfig.from_dict({"storage_path": "/tmp/hub"})
     assert config.at_rest_keyfile == "/tmp/hub/at_rest.key"
+
+
+def test_paths_are_expanded(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/operator")
+    config = HubConfig.from_dict(
+        {"storage_path": "~/hub", "reticulum_config_path": "~/.reticulum"}
+    )
+    assert config.resolved_storage_path == "/home/operator/hub"
+    assert config.resolved_reticulum_config_path == "/home/operator/.reticulum"
+    assert HubConfig().resolved_reticulum_config_path is None

@@ -71,6 +71,12 @@ class HubConfig:
         return os.path.abspath(os.path.expanduser(self.storage_path))
 
     @property
+    def resolved_reticulum_config_path(self) -> str | None:
+        if self.reticulum_config_path is None:
+            return None
+        return os.path.abspath(os.path.expanduser(self.reticulum_config_path))
+
+    @property
     def database_path(self) -> str:
         return os.path.join(self.resolved_storage_path, "hub.db")
 

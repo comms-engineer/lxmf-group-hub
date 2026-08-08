@@ -56,7 +56,10 @@ class HubDaemon:
         storage = self.config.resolved_storage_path
         os.makedirs(storage, exist_ok=True)
 
-        RNS.Reticulum(configdir=self.config.reticulum_config_path, loglevel=self.config.log_level)
+        RNS.Reticulum(
+            configdir=self.config.resolved_reticulum_config_path,
+            loglevel=self.config.log_level,
+        )
 
         self.store = Store(self.config.database_path)
         if self.config.at_rest.mode != MODE_NONE:
@@ -101,6 +104,10 @@ class HubDaemon:
 
     def run(self) -> None:
         self.start()
+        self.supervise()
+
+    def supervise(self) -> None:
+        """Supervision loop for an already started daemon."""
         signal.signal(signal.SIGINT, self._signal)
         signal.signal(signal.SIGTERM, self._signal)
 
