@@ -36,6 +36,8 @@ lxmf-hub --config hub.json run
 
 Administration is out of band by design, because in-band commands would mean parsing text from unauthenticated senders. Groups, ACLs, and roles live in SQLite; `create-group`, `add-member`, `remove-member`, `set-acl`, `groups`, `members`, and `status` all operate on the database directly and are safe to run while the daemon is up. A running daemon rescans the `groups` table every 30 seconds and attaches anything new, so a group created at 14:02 is announcing by 14:03 without a restart.
 
+`status` prints the group count, the egress queue depth, and, when `operator_identity` is set, the control destination hash operators address.
+
 Two ACL modes exist. In an `invite` group, a message from a hash that isn't in `members` is logged and dropped. In a `public` group, the first signed message from an unknown hash enrolls that sender as `member`. Roles are `member`, `admin`, and `banned`; a `banned` hash can't post and is skipped during fan-out, so banning takes effect on the next message rather than at the next restart.
 
 ## Configuration
@@ -53,6 +55,7 @@ Every key is optional. The values below are the built-in defaults.
   "author_field": 253,
   "author_prefix_in_content": true,
   "log_level": 4,
+  "operator_identity": null,
   "at_rest": { "mode": "keyfile", "keyfile": null },
   "egress": {
     "tokens_per_second": 0.5,
@@ -81,6 +84,29 @@ Every key is optional. The values below are the built-in defaults.
 ```
 
 Unknown keys raise `ValueError` at load time instead of being ignored, so a typo like `"storaeg_path"` fails on startup rather than silently sending your database somewhere else. `hub.example.json` holds a working file.
+
+## Operator control over LXMF
+
+`operator_identity` takes an LXMF destination hash, or a list of them, and brings up a control destination on the hub identity. It's a separate destination from every group, so group traffic never carries commands and members never see an admin surface. Authorisation is the same Ed25519 signature check the group path uses, against a fixed list of hashes. No password, no token, no session.
+
+```json
+{ "operator_identity": ["8f1c0d7a4b2e6f9081c3d5a7b9e1f3c5"] }
+```
+
+Commands are the CLI verbs, sent as ordinary message text from an allowed hash:
+
+```
+groups                          ->  ops   invite   3 member(s)   b196e0eb...
+create-group nets --acl public  ->  nets  public   7d41c9a2...
+add-member ops 8f1c0d7a...      ->  8f1c0d7a... is member in ops
+status                          ->  groups 2, egress_queue 0, control 707a7f49...
+```
+
+`create-group`, `groups`, `set-acl`, `add-member`, `remove-member`, `members`, and `status` are reachable. `run` is not, and anything outside that set comes back as a list of what is. Argument errors, unknown groups, and malformed hashes are answered as text instead of raising, because there's no terminal on the other end to read a traceback. Commands write to SQLite and the daemon hot-loads them, so a group created from a phone is announcing within 30 seconds.
+
+A message on the control destination from a hash that isn't an operator, or one whose signature didn't validate, is logged at notice level and dropped with no reply. Replies go out directly rather than through the client egress queue, since two packets to one operator shouldn't spend tokens meant for keeping group reflections off a saturated RF interface.
+
+The control hash comes from `lxmf-hub status` or the startup log line `Operator control on <707a7f49...>`.
 
 ## Reflection and author attribution
 
@@ -159,6 +185,10 @@ Every encryptable column carries a one byte frame, `0x00` for plaintext and `0x0
 
 This protects a stolen disk, a copied backup, or a decommissioned SD card. It does not protect a live compromised host, because the daemon holds the key in memory for as long as it runs. Root on a running hub reads group traffic either way.
 
+## What this doesn't do
+
+A group's destination hash comes from that hub's own identity, so the same group on two federated hubs has two addresses. Federation keeps the message sets equal; it doesn't give a client one address that survives a hub dying. If the hub a member holds as a contact goes offline, their messages fail in their own LXMF queue and nothing tells them where else to go. Failover that unmodified clients can act on needs either a notice-and-adopt scheme between peers or a group key replicated across hubs, and neither is built.
+
 ## Crash consistency
 
 SQLite runs with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=30000`. Every state transition is committed before it's acted on, which is what makes the egress guarantee above hold: the queue row exists on disk before the message is handed to the router, and the peer sync timestamp is written after the ingest that earned it.
@@ -166,11 +196,11 @@ SQLite runs with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=300
 ## Tests
 
 ```bash
-pytest -q      # 57 tests
+pytest -q      # 74 tests
 ruff check .
 ```
 
-The suite covers WAL mode, dedup, hub-independent hashing, ACL enforcement for all three roles, author-field stripping, token bucket pacing, backoff growth and its ceiling, attempt capping, propagation versus direct method selection, wrong-key detection, exact Merkle traversal against a known missing set, multi-epoch backfill, and peer rejection on mismatched parameters.
+The suite covers WAL mode, dedup, hub-independent hashing, ACL enforcement for all three roles, author-field stripping, token bucket pacing, backoff growth and its ceiling, attempt capping, propagation versus direct method selection, wrong-key detection, exact Merkle traversal against a known missing set, multi-epoch backfill, peer rejection on mismatched parameters, and the control path including refusal of non-operators, unsigned messages, and verbs outside the remote allowlist.
 
 `tools/local_testnet.py` runs each role as a separate Reticulum instance over localhost TCP, with its own config directory, its own TCP interface, and `share_instance = No`, so reflection, egress, and federation are exercised over real RNS packets rather than in-process fakes:
 

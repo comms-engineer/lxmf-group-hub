@@ -104,6 +104,7 @@ def run_hub(args: argparse.Namespace) -> int:
             "log_level": LOGLEVEL,
             "announce_interval_sec": 20,
             "announce_jitter_sec": 0,
+            "operator_identity": args.operator or None,
             "egress": {"tokens_per_second": 1.0, "burst": 2, "retry_backoff_sec": 10},
             "federation": {
                 "peers": args.peer,
@@ -135,6 +136,8 @@ def run_hub(args: argparse.Namespace) -> int:
         )
     if daemon.federation is not None:
         print(f"federation endpoint: {daemon.federation.destination.hash.hex()}", flush=True)
+    if daemon.control is not None and daemon.control.destination is not None:
+        print(f"control endpoint: {daemon.control.destination.hash.hex()}", flush=True)
 
     # Same supervision loop as the real daemon, so hot-loading and pruning are
     # exercised by the harness too.
@@ -209,6 +212,7 @@ def main() -> int:
     hub.add_argument("--public", action="store_true", help="create the group with a public ACL")
     hub.add_argument("--member", nargs="*", default=[], help="member hashes to authorise")
     hub.add_argument("--peer", nargs="*", default=[], help="federation hashes of peer hubs")
+    hub.add_argument("--operator", nargs="*", default=[], help="operator hashes for LXMF control")
 
     client = subparsers.add_parser("client")
     client.add_argument("--name", required=True)

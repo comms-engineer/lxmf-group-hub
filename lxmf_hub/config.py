@@ -7,6 +7,9 @@ import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any
 
+# RNS truncates destination hashes to 128 bits.
+DESTINATION_HASH_LENGTH = 16
+
 
 @dataclass
 class EgressConfig:
@@ -62,6 +65,9 @@ class HubConfig:
     author_field: int = 0xFD
     author_prefix_in_content: bool = True
     log_level: int = 4
+    # LXMF destination hash, or list of hashes, allowed to administer this hub
+    # over LXMF. Empty means the control destination is never brought up.
+    operator_identity: str | list[str] | None = None
     at_rest: AtRestConfig = field(default_factory=AtRestConfig)
     egress: EgressConfig = field(default_factory=EgressConfig)
     federation: FederationConfig = field(default_factory=FederationConfig)
@@ -83,6 +89,27 @@ class HubConfig:
     @property
     def identity_path(self) -> str:
         return os.path.join(self.resolved_storage_path, "hub_identity")
+
+    @property
+    def operator_hashes(self) -> list[bytes]:
+        """Operator destination hashes, validated as 16-byte hex strings."""
+        raw = self.operator_identity
+        if raw is None:
+            return []
+        values = [raw] if isinstance(raw, str) else list(raw)
+        hashes = []
+        for value in values:
+            try:
+                operator_hash = bytes.fromhex(value.strip())
+            except ValueError as exception:
+                raise ValueError(f"operator_identity '{value}' is not hex") from exception
+            if len(operator_hash) != DESTINATION_HASH_LENGTH:
+                raise ValueError(
+                    f"operator_identity '{value}' is not a"
+                    f" {DESTINATION_HASH_LENGTH}-byte destination hash"
+                )
+            hashes.append(operator_hash)
+        return hashes
 
     @property
     def at_rest_keyfile(self) -> str:
