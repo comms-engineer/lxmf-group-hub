@@ -16,6 +16,7 @@ import LXMF
 import RNS
 
 from .config import HubConfig
+from .control import ControlChannel
 from .crypto import MODE_NONE
 from .destinations import VirtualDestinationManager
 from .egress import EgressScheduler
@@ -48,6 +49,7 @@ class HubDaemon:
         self.destinations: VirtualDestinationManager | None = None
         self.egress: EgressScheduler | None = None
         self.federation: FederationEngine | None = None
+        self.control: ControlChannel | None = None
         self._stop = threading.Event()
 
     # -- startup ---------------------------------------------------------
@@ -73,7 +75,12 @@ class HubDaemon:
 
         self.destinations = VirtualDestinationManager(self.router, self.store, self.config)
         self.hub = GroupHub(self.config, self.store, self.router, self.destinations)
-        self.router.register_delivery_callback(self.hub.handle_inbound)
+        self.router.register_delivery_callback(self.deliver)
+
+        # Before load_groups: LXMRouter.register_delivery_identity refuses to run
+        # once any delivery destination is registered.
+        self.control = ControlChannel(self.config, self.store, self.router)
+        self.control.start()
 
         propagation_node = self.config.egress.propagation_node
         if propagation_node:
@@ -100,6 +107,15 @@ class HubDaemon:
             RNS.LOG_NOTICE,
         )
 
+    # -- delivery --------------------------------------------------------
+
+    def deliver(self, message: LXMF.LXMessage) -> None:
+        """Route an inbound LXMF message to the control channel or a group."""
+        if self.control is not None and self.control.owns(message.destination_hash):
+            self.control.handle(message)
+            return
+        self.hub.handle_inbound(message)
+
     # -- supervision -----------------------------------------------------
 
     def run(self) -> None:
@@ -121,6 +137,8 @@ class HubDaemon:
                     for group_id in self.destinations.load_groups():
                         RNS.log(f"Hot-loaded group '{group_id}'", RNS.LOG_NOTICE)
                 self.destinations.announce_due()
+                if self.control is not None:
+                    self.control.announce_due()
                 if now - last_prune >= PRUNE_INTERVAL:
                     last_prune = now
                     pruned = self.hub.prune()

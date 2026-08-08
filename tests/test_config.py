@@ -48,6 +48,23 @@ def test_at_rest_keyfile_defaults_into_storage_path():
     assert config.at_rest_keyfile == "/tmp/hub/at_rest.key"
 
 
+def test_operator_identity_accepts_one_hash_or_several():
+    single = HubConfig.from_dict({"operator_identity": "ab" * 16})
+    assert single.operator_hashes == [bytes.fromhex("ab" * 16)]
+
+    several = HubConfig.from_dict({"operator_identity": ["ab" * 16, "cd" * 16]})
+    assert several.operator_hashes == [bytes.fromhex("ab" * 16), bytes.fromhex("cd" * 16)]
+
+    assert HubConfig().operator_hashes == []
+
+
+@pytest.mark.parametrize("value", ["nothex", "ab" * 8, "ab" * 32, ""])
+def test_malformed_operator_identity_is_rejected(value):
+    config = HubConfig.from_dict({"operator_identity": value})
+    with pytest.raises(ValueError):
+        assert config.operator_hashes
+
+
 def test_paths_are_expanded(monkeypatch):
     monkeypatch.setenv("HOME", "/home/operator")
     config = HubConfig.from_dict(

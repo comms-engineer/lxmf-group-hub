@@ -2,6 +2,7 @@
   "storage_path": "~/.lxmf_hub",
   "hub_name": "Example Group Hub",
   "default_acl_mode": "invite",
+  "operator_identity": null,
   "egress": {
     "tokens_per_second": 0.5,
     "burst": 4,
