@@ -39,6 +39,7 @@ REMOTE_COMMANDS = frozenset(
         "remove-member",
         "members",
         "status",
+        "peers",
     }
 )
 

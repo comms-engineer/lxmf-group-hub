@@ -32,6 +32,11 @@ def identity_from_key(private_key: bytes) -> RNS.Identity:
     return identity
 
 
+def group_destination_hash(identity_key: bytes) -> bytes:
+    """Destination hash a client addresses, derived without touching Transport."""
+    return RNS.Destination.hash(identity_from_key(identity_key), LXMF.APP_NAME, "delivery")
+
+
 class VirtualDestinationManager:
     """Owns the group identities and their LXMF delivery destinations."""
 

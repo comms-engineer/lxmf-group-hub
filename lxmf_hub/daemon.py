@@ -19,7 +19,9 @@ from .config import HubConfig
 from .control import ControlChannel
 from .crypto import MODE_NONE
 from .destinations import VirtualDestinationManager
+from .directory import DirectoryChannel
 from .egress import EgressScheduler
+from .failover import FailoverEngine
 from .federation import FederationEngine
 from .hub import GroupHub
 from .store import Store
@@ -50,6 +52,8 @@ class HubDaemon:
         self.egress: EgressScheduler | None = None
         self.federation: FederationEngine | None = None
         self.control: ControlChannel | None = None
+        self.directory: DirectoryChannel | None = None
+        self.failover: FailoverEngine | None = None
         self._stop = threading.Event()
 
     # -- startup ---------------------------------------------------------
@@ -89,10 +93,13 @@ class HubDaemon:
                 f"Queueing client egress via propagation node {propagation_node}", RNS.LOG_NOTICE
             )
 
+        self.directory = DirectoryChannel(self.config, self.store, self.router)
+        self.directory.start()
+
         self.destinations.load_groups()
 
         self.egress = EgressScheduler(
-            self.config, self.store, self.hub, self.router, self.destinations
+            self.config, self.store, self.hub, self.router, self.destinations, self.directory
         )
         self.egress.start()
 
@@ -100,6 +107,8 @@ class HubDaemon:
             self.federation = FederationEngine(self.config, self.store, self.hub, identity)
             self.federation.start()
             self.federation.announce()
+            if self.config.failover.enabled:
+                self.failover = FailoverEngine(self.config, self.store, self.hub)
 
         RNS.log(
             f"Hub running with {len(self.destinations.attached_groups())} group(s)"
@@ -113,6 +122,9 @@ class HubDaemon:
         """Route an inbound LXMF message to the control channel or a group."""
         if self.control is not None and self.control.owns(message.destination_hash):
             self.control.handle(message)
+            return
+        if self.directory is not None and self.directory.owns(message.destination_hash):
+            self.directory.handle(message)
             return
         self.hub.handle_inbound(message)
 
@@ -139,6 +151,10 @@ class HubDaemon:
                 self.destinations.announce_due()
                 if self.control is not None:
                     self.control.announce_due()
+                if self.directory is not None:
+                    self.directory.announce_due()
+                if self.failover is not None:
+                    self.failover.check_due(now)
                 if now - last_prune >= PRUNE_INTERVAL:
                     last_prune = now
                     pruned = self.hub.prune()

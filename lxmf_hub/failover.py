@@ -1,0 +1,237 @@
+"""Peer liveness, adoption of a dead hub's members, and client notices.
+
+A group's destination hash belongs to the hub that generated its identity, so a
+hub going down takes its address with it. Nothing in RNS or LXMF tells a client
+to use a different address, and an unmodified client cannot be told to in any
+machine-readable way. What is left is telling the human: a short message, from a
+contact the client already has, naming the hash to add.
+
+The liveness signal is the last federation round a peer actually answered, not
+the last one this hub attempted. A peer silent for ``peer_timeout_sec`` is
+treated as down, which is a statement about this hub's vantage point and not a
+claim that the peer is unreachable from anywhere else.
+
+Three events produce a notice:
+
+- Adoption. A peer went stale, this hub serves the same group, so it starts
+  delivering to that peer's members and tells them which hash to post to.
+- Hand-back. The peer answered again; adopted members are released and told.
+- Isolation. This hub can reach none of its peers. Its own members are told that
+  messages may not be reaching members elsewhere, and are given the other hubs'
+  addresses for that group so they can decide for themselves.
+
+A hub does not adopt a peer's members for a group it does not host, and never
+touches the peer's database. Adoption rows live in SQLite, so a restart mid
+outage neither re-notifies nor forgets.
+"""
+
+from __future__ import annotations
+
+import time
+
+import RNS
+
+from .config import HubConfig
+from .hub import GroupHub
+from .store import Store
+
+FLAG_ISOLATED = "isolated"
+
+
+def format_age(seconds: float) -> str:
+    if seconds < 120:
+        return f"{int(seconds)}s"
+    if seconds < 7200:
+        return f"{int(seconds / 60)}m"
+    return f"{int(seconds / 3600)}h"
+
+
+class FailoverEngine:
+    """Watches peer liveness and tells affected clients what changed."""
+
+    def __init__(self, config: HubConfig, store: Store, hub: GroupHub):
+        self.config = config
+        self.store = store
+        self.hub = hub
+        self.started_at = time.time()
+        self._peers: list[bytes] = [bytes.fromhex(peer) for peer in config.federation.peers]
+        self._last_check = 0.0
+
+    # -- liveness --------------------------------------------------------
+
+    def peer_reference(self, peer_hash: bytes) -> float:
+        """When this hub last had evidence the peer was up.
+
+        A peer never reached since startup counts from startup, not from the
+        epoch, so a hub that boots into an ongoing outage still adopts after one
+        timeout instead of adopting immediately.
+        """
+        last_success = self.store.peer_last_success(peer_hash) or 0.0
+        return max(last_success, self.started_at)
+
+    def stale_peers(self, now: float | None = None) -> list[bytes]:
+        now = time.time() if now is None else now
+        timeout = self.config.failover.peer_timeout_sec
+        return [peer for peer in self._peers if now - self.peer_reference(peer) > timeout]
+
+    # -- main loop -------------------------------------------------------
+
+    def check_due(self, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        if now - self._last_check < self.config.failover.check_interval_sec:
+            return False
+        self._last_check = now
+        self.check(now)
+        return True
+
+    def check(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        stale = set(self.stale_peers(now))
+
+        for peer_hash in self._peers:
+            if peer_hash in stale:
+                self.adopt_peer(peer_hash)
+            elif peer_hash in set(self.store.adopted_peers()):
+                self.release(peer_hash)
+
+        self.check_isolation(stale)
+
+    # -- adoption --------------------------------------------------------
+
+    def adopt_peer(self, peer_hash: bytes) -> int:
+        """Serve the members of an unreachable peer, for shared groups only."""
+        adopted = 0
+        hub_name = self.peer_name(peer_hash)
+        for group in self.store.list_groups():
+            members = self.store.list_peer_members(peer_hash, group.group_id)
+            if not members:
+                continue
+            local = {user_hash for user_hash, _role in self.store.list_members(group.group_id)}
+            fresh = self.store.adopt(
+                peer_hash, group.group_id, [item for item in members if item not in local]
+            )
+            if not fresh:
+                continue
+            adopted += len(fresh)
+            RNS.log(
+                f"Serving {len(fresh)} member(s) of group '{group.group_id}' for unreachable peer"
+                f" {RNS.prettyhexrep(peer_hash)}",
+                RNS.LOG_NOTICE,
+            )
+            if self.config.failover.notify_clients:
+                body = self.adoption_notice(group.group_id, hub_name)
+                for user_hash in fresh:
+                    self.store.enqueue_notice(group.group_id, user_hash, body)
+        return adopted
+
+    def release(self, peer_hash: bytes) -> int:
+        """Hand a recovered peer's members back and tell them so."""
+        released = self.store.release_peer(peer_hash)
+        if not released:
+            return 0
+        hub_name = self.peer_name(peer_hash)
+        RNS.log(
+            f"Peer {RNS.prettyhexrep(peer_hash)} answered again, releasing"
+            f" {len(released)} adopted member(s)",
+            RNS.LOG_NOTICE,
+        )
+        if self.config.failover.notify_clients:
+            for group_id, user_hash in released:
+                self.store.enqueue_notice(
+                    group_id, user_hash, self.handback_notice(group_id, hub_name, peer_hash)
+                )
+        return len(released)
+
+    # -- isolation -------------------------------------------------------
+
+    def check_isolation(self, stale: set[bytes]) -> bool:
+        """Tell local members when this hub can reach none of its peers.
+
+        Their messages are still stored and reflected to everyone on this hub, so
+        the group has not stopped working; what has stopped is anything crossing
+        to the other hubs. That distinction is what the notice states.
+        """
+        if not self._peers:
+            return False
+        isolated = len(stale) == len(self._peers)
+        was_isolated = self.store.get_flag(FLAG_ISOLATED)
+        if isolated == was_isolated:
+            return False
+
+        self.store.set_flag(FLAG_ISOLATED, isolated)
+        RNS.log(
+            "This hub cannot reach any federation peer"
+            if isolated
+            else "Federation peer connectivity restored",
+            RNS.LOG_WARNING if isolated else RNS.LOG_NOTICE,
+        )
+        if not self.config.failover.notify_isolation:
+            return True
+
+        for group in self.store.list_groups():
+            body = (
+                self.isolation_notice(group.group_id)
+                if isolated
+                else f"{group.group_id}: this hub is back in contact with its peers."
+                " Messages are crossing to the other hubs again."
+            )
+            for user_hash, _role in self.store.list_members(group.group_id):
+                self.store.enqueue_notice(group.group_id, user_hash, body)
+        return True
+
+    # -- notice text -----------------------------------------------------
+
+    def adoption_notice(self, group_id: str, peer_name: str) -> str:
+        destination = self.local_endpoint(group_id)
+        return (
+            f"{group_id}: your hub ({peer_name}) has not answered this hub for"
+            f" {format_age(self.config.failover.peer_timeout_sec)}."
+            f" {self.config.hub_name} is serving {group_id} in the meantime."
+            f" To post, add this contact: {destination}."
+            " You keep receiving messages here either way."
+        )
+
+    def handback_notice(self, group_id: str, peer_name: str, peer_hash: bytes) -> str:
+        endpoint = self.peer_endpoint(peer_hash, group_id)
+        home = f" Its address is {endpoint}." if endpoint else ""
+        return (
+            f"{group_id}: {peer_name} is answering again, so {self.config.hub_name}"
+            f" has stopped serving you.{home}"
+        )
+
+    def isolation_notice(self, group_id: str) -> str:
+        others = self.other_endpoints(group_id)
+        alternatives = (
+            " Other hubs for this group: " + "; ".join(others) if others else ""
+        )
+        return (
+            f"{group_id}: {self.config.hub_name} cannot reach any peer hub."
+            " Messages here still reach everybody on this hub, but may not be"
+            f" reaching members on the others.{alternatives}"
+        )
+
+    # -- endpoints -------------------------------------------------------
+
+    def local_endpoint(self, group_id: str) -> str:
+        destination = self.hub.destinations.destination_for(group_id)
+        return destination.hash.hex() if destination is not None else "unknown"
+
+    def peer_endpoint(self, peer_hash: bytes, group_id: str) -> str | None:
+        for entry in self.store.list_peer_groups(group_id):
+            if entry.peer_hash == peer_hash:
+                return entry.destination_hash.hex()
+        return None
+
+    def other_endpoints(self, group_id: str) -> list[str]:
+        now = time.time()
+        return [
+            f"{entry.hub_name} {entry.destination_hash.hex()}"
+            f" (last seen {format_age(now - entry.updated_at)} ago)"
+            for entry in self.store.list_peer_groups(group_id)
+        ]
+
+    def peer_name(self, peer_hash: bytes) -> str:
+        for entry in self.store.list_peer_groups():
+            if entry.peer_hash == peer_hash:
+                return entry.hub_name
+        return RNS.prettyhexrep(peer_hash)

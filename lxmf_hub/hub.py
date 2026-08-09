@@ -140,6 +140,11 @@ class GroupHub:
             return False
         if role is not None:
             return True
+        if self.store.is_peer_member(group.group_id, sender_hash):
+            # A member of this group on a federated hub is a member of the group.
+            # Accepting their posts here is what makes a failover address usable
+            # in an invite-only group without the operator re-inviting anyone.
+            return True
         if group.acl_mode == ACL_PUBLIC:
             self.store.add_member(group.group_id, sender_hash, ROLE_MEMBER)
             RNS.log(
@@ -186,10 +191,24 @@ class GroupHub:
 
     # -- fan out ---------------------------------------------------------
 
+    def recipients(self, group_id: str) -> list[bytes]:
+        """Who this hub delivers to: its own members, plus adopted ones.
+
+        Members of a live peer are deliberately absent. They get their copy from
+        their own hub, and delivering to them as well would put two copies of
+        every message on their RF link. Adopted members are the exception: their
+        hub stopped answering, so this one delivers in its place.
+        """
+        local = [user_hash for user_hash, _role in self.store.list_members(group_id)]
+        known = set(local)
+        return local + [
+            user_hash for user_hash in self.store.list_adopted(group_id) if user_hash not in known
+        ]
+
     def fan_out(self, record: MessageRecord) -> int:
-        """Queue a stored message for every member except its author."""
+        """Queue a stored message for every recipient except its author."""
         queued = 0
-        for user_hash, _role in self.store.list_members(record.group_id):
+        for user_hash in self.recipients(record.group_id):
             if user_hash == record.sender_hash:
                 continue
             if self.store.enqueue_egress(record.group_id, user_hash, record.msg_hash):
@@ -238,6 +257,25 @@ class GroupHub:
             fields=fields,
         )
 
+    def build_notice(self, group_id: str, recipient_identity: RNS.Identity, body: str):
+        """Build a hub-authored message: failover notices and directory answers.
+
+        It carries no author metadata, because the hub is the author. A client
+        renders it as ordinary text from the group contact it already holds,
+        which is the only channel an unmodified client can be reached on.
+        """
+        source = self.destinations.destination_for(group_id)
+        if source is None:
+            raise ValueError(f"Group '{group_id}' is not attached")
+        destination = RNS.Destination(
+            recipient_identity,
+            RNS.Destination.OUT,
+            RNS.Destination.SINGLE,
+            LXMF.APP_NAME,
+            "delivery",
+        )
+        return LXMF.LXMessage(destination, source, content=body.encode("utf-8"), title=b"")
+
     # -- retention -------------------------------------------------------
 
     def prune(self) -> int:
@@ -250,4 +288,5 @@ class GroupHub:
         return [
             f"groups={len(self.destinations.attached_groups())}",
             f"egress_queue={self.store.egress_depth()}",
+            f"notice_queue={self.store.notice_depth()}",
         ]

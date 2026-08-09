@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 import LXMF
 import RNS
 
 from .config import HubConfig
 from .crypto import MODE_NONE
-from .destinations import identity_from_key
+from .destinations import group_destination_hash
+from .failover import format_age
 from .store import (
     ACL_INVITE,
     ACL_PUBLIC,
@@ -53,12 +55,6 @@ class TextParser(argparse.ArgumentParser):
     def exit(self, status=0, message=None) -> None:
         text = "".join(self._collected) or message or ""
         raise CommandError(text.strip())
-
-
-def group_destination_hash(identity_key: bytes) -> bytes:
-    """Destination hash a client would address, derived without touching RNS."""
-    identity = identity_from_key(identity_key)
-    return RNS.Destination.hash(identity, LXMF.APP_NAME, "delivery")
 
 
 def control_destination_hash(config: HubConfig) -> bytes | None:
@@ -109,6 +105,8 @@ def build_parser() -> TextParser:
     members.add_argument("group_id")
 
     subparsers.add_parser("status", help="show queue depth and group counts")
+
+    subparsers.add_parser("peers", help="show peer hubs, their endpoints and last contact")
     return parser
 
 
@@ -158,10 +156,30 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
         ]
         return "\n".join(lines) or "no members"
 
+    if args.command == "peers":
+        now = time.time()
+        lines = []
+        for peer in config.federation.peers:
+            peer_hash = bytes.fromhex(peer)
+            last = store.peer_last_success(peer_hash)
+            seen = f"{format_age(now - last)} ago" if last else "never"
+            adopted = sum(
+                len(store.list_peer_members(peer_hash, group.group_id))
+                for group in store.list_groups()
+            )
+            lines.append(f"{peer}\tlast answered {seen}\t{adopted} member(s) known")
+            for entry in store.list_peer_groups():
+                if entry.peer_hash == peer_hash:
+                    lines.append(
+                        f"  {entry.group_id}\t{entry.hub_name}\t{entry.destination_hash.hex()}"
+                    )
+        return "\n".join(lines) or "no peers configured"
+
     if args.command == "status":
         lines = [
             f"groups\t{len(store.list_groups())}",
             f"egress_queue\t{store.egress_depth()}",
+            f"notice_queue\t{store.notice_depth()}",
         ]
         control = control_destination_hash(config) if config.operator_hashes else None
         if control is not None:

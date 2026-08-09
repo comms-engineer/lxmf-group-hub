@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import msgpack
 import pytest
+import RNS
 
 from lxmf_hub.config import HubConfig
 from lxmf_hub.federation import FederationEngine
@@ -61,6 +62,7 @@ class FakeLink:
             "/fed/tree": self.server._serve_tree,
             "/fed/bucket": self.server._serve_bucket,
             "/fed/fetch": self.server._serve_fetch,
+            "/fed/state": self.server._serve_state,
         }[path]
         arguments = [path, roundtrip(data), b"request", self.remote_identity, 0.0]
         if path == "/fed/fetch":
@@ -108,9 +110,10 @@ def build_hub(tmp_path, name, peers, epoch_seconds=3600, depth=6):
     config.federation.epoch_seconds = epoch_seconds
     config.federation.merkle_depth = depth
     config.federation.retention_epochs = 10**6
+    config.hub_name = name
 
     store = Store(str(tmp_path / f"{name}.db"))
-    store.create_group(GROUP, "Ops", b"\x00" * 64, acl_mode=ACL_PUBLIC)
+    store.create_group(GROUP, "Ops", RNS.Identity().get_private_key(), acl_mode=ACL_PUBLIC)
     store.add_member(GROUP, AUTHOR)
     store.add_member(GROUP, MEMBER)
     destinations = StubDestinations({GROUP_DESTINATION: GROUP})
@@ -149,7 +152,7 @@ def test_identical_hubs_transfer_nothing(pair):
         seed(store, 5)
 
     assert local.sync_peer(PEER_B) == 0
-    assert local.link_to_peer.requests == ["/fed/roots"]
+    assert local.link_to_peer.requests == ["/fed/state", "/fed/roots"]
 
 
 def test_missing_messages_are_fetched_as_a_resource(pair):

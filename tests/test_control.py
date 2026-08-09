@@ -90,7 +90,20 @@ def test_roles_and_acl_changes_go_through(tmp_path):
 def test_status_reports_group_count_and_queue_depth(tmp_path):
     channel, _store = make_channel(tmp_path)
     channel.execute("create-group ops")
-    assert channel.execute("status") == "groups\t1\negress_queue\t0"
+    assert channel.execute("status") == "groups\t1\negress_queue\t0\nnotice_queue\t0"
+
+
+def test_peers_reports_a_hub_that_has_never_answered(tmp_path):
+    channel, _store = make_channel(tmp_path)
+    channel.config.federation.peers = ["0b" * 16]
+
+    assert channel.execute("peers").startswith(f"{'0b' * 16}\tlast answered never")
+
+
+def test_peers_says_so_when_none_are_configured(tmp_path):
+    channel, _store = make_channel(tmp_path)
+
+    assert channel.execute("peers") == "no peers configured"
 
 
 @pytest.mark.parametrize(

@@ -43,6 +43,30 @@ class FederationConfig:
 
 
 @dataclass
+class FailoverConfig:
+    """What a hub does when a peer stops answering.
+
+    ``peer_timeout_sec`` defaults to six federation sync intervals, so a single
+    missed round, a path rebuild, or a restart on the peer does not put failover
+    notices on anybody's RF link.
+    """
+
+    enabled: bool = True
+    peer_timeout_sec: float = 1800.0
+    check_interval_sec: float = 60.0
+    notify_clients: bool = True
+    notify_isolation: bool = True
+
+
+@dataclass
+class DirectoryConfig:
+    """The endpoint directory clients can query for group addresses."""
+
+    enabled: bool = True
+    min_reply_interval_sec: float = 60.0
+
+
+@dataclass
 class AtRestConfig:
     """At-rest encryption of message payloads and group private keys."""
 
@@ -71,6 +95,8 @@ class HubConfig:
     at_rest: AtRestConfig = field(default_factory=AtRestConfig)
     egress: EgressConfig = field(default_factory=EgressConfig)
     federation: FederationConfig = field(default_factory=FederationConfig)
+    failover: FailoverConfig = field(default_factory=FailoverConfig)
+    directory: DirectoryConfig = field(default_factory=DirectoryConfig)
 
     @property
     def resolved_storage_path(self) -> str:
@@ -110,6 +136,10 @@ class HubConfig:
                 )
             hashes.append(operator_hash)
         return hashes
+
+    @property
+    def directory_identity_path(self) -> str:
+        return os.path.join(self.resolved_storage_path, "directory_identity")
 
     @property
     def at_rest_keyfile(self) -> str:

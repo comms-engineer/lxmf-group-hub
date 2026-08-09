@@ -76,6 +76,63 @@ CREATE TABLE IF NOT EXISTS peers (
     last_error   TEXT
 );
 
+-- Last time a peer actually answered. Separate from peers.last_sync_at, which
+-- records every attempt including the failed ones: a hub whose peer is down
+-- still writes a row every sync round, so that column cannot say who is up.
+CREATE TABLE IF NOT EXISTS peer_liveness (
+    peer_hash       BLOB PRIMARY KEY,
+    last_success_at REAL NOT NULL
+);
+
+-- What a peer told us it serves, so the directory can answer with other hubs'
+-- endpoints and a standby knows which destination to name in a notice.
+CREATE TABLE IF NOT EXISTS peer_groups (
+    peer_hash        BLOB NOT NULL,
+    group_id         TEXT NOT NULL,
+    destination_hash BLOB NOT NULL,
+    hub_name         TEXT NOT NULL,
+    acl_mode         TEXT NOT NULL,
+    updated_at       REAL NOT NULL,
+    PRIMARY KEY (peer_hash, group_id)
+);
+
+-- Peer member sets, kept so a standby can serve a dead hub's members.
+CREATE TABLE IF NOT EXISTS peer_members (
+    peer_hash  BLOB NOT NULL,
+    group_id   TEXT NOT NULL,
+    user_hash  BLOB NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (peer_hash, group_id, user_hash)
+);
+
+-- Members of an unreachable peer that this hub is currently serving. Rows
+-- survive restarts, so an adoption is announced once and released once.
+CREATE TABLE IF NOT EXISTS adoptions (
+    peer_hash  BLOB NOT NULL,
+    group_id   TEXT NOT NULL,
+    user_hash  BLOB NOT NULL,
+    adopted_at REAL NOT NULL,
+    PRIMARY KEY (peer_hash, group_id, user_hash)
+);
+
+-- Hub-generated text for one client: failover notices and directory answers do
+-- not reference a stored message, but still have to be paced and retried.
+-- ``source`` says which of the hub's destinations it goes out from, since a
+-- directory answer cannot come from a group the reader may not be a member of.
+CREATE TABLE IF NOT EXISTS notice_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT NOT NULL,
+    group_id        TEXT NOT NULL,
+    recipient_hash  BLOB NOT NULL,
+    body            TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL,
+    created_at      REAL NOT NULL,
+    UNIQUE (recipient_hash, body)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notice_due ON notice_queue (next_attempt_at);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -114,6 +171,30 @@ class EgressItem:
     recipient_hash: bytes
     msg_hash: bytes
     attempts: int
+
+
+SOURCE_GROUP = "group"
+SOURCE_DIRECTORY = "directory"
+
+
+@dataclass(frozen=True)
+class NoticeItem:
+    item_id: int
+    source: str
+    group_id: str
+    recipient_hash: bytes
+    body: str
+    attempts: int
+
+
+@dataclass(frozen=True)
+class PeerGroup:
+    peer_hash: bytes
+    group_id: str
+    destination_hash: bytes
+    hub_name: str
+    acl_mode: str
+    updated_at: float
 
 
 def group_hash(group_id: str) -> bytes:
@@ -448,6 +529,215 @@ class Store:
                 "SELECT last_sync_at, last_error FROM peers WHERE peer_hash = ?", (peer_hash,)
             ).fetchone()
         return (row["last_sync_at"], row["last_error"]) if row else None
+
+    def record_peer_success(self, peer_hash: bytes, now: float | None = None) -> None:
+        """Note that a peer answered. This is the only liveness evidence there is."""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO peer_liveness (peer_hash, last_success_at) VALUES (?, ?)"
+                " ON CONFLICT (peer_hash) DO UPDATE SET last_success_at = excluded.last_success_at",
+                (peer_hash, now),
+            )
+            self._db.commit()
+
+    def peer_last_success(self, peer_hash: bytes) -> float | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT last_success_at FROM peer_liveness WHERE peer_hash = ?", (peer_hash,)
+            ).fetchone()
+        return row["last_success_at"] if row else None
+
+    # -- peer state gossip -----------------------------------------------
+
+    def record_peer_state(
+        self,
+        peer_hash: bytes,
+        hub_name: str,
+        groups: dict[str, tuple[bytes, str]],
+        members: dict[str, list[bytes]],
+    ) -> None:
+        """Replace what we know a peer serves, in one transaction.
+
+        Replacing rather than merging matters: a group unregistered or a member
+        removed on the peer has to disappear here too, or a standby would keep
+        serving somebody the other operator ejected.
+        """
+        now = time.time()
+        with self._lock:
+            self._db.execute("DELETE FROM peer_groups WHERE peer_hash = ?", (peer_hash,))
+            self._db.execute("DELETE FROM peer_members WHERE peer_hash = ?", (peer_hash,))
+            self._db.executemany(
+                "INSERT INTO peer_groups"
+                " (peer_hash, group_id, destination_hash, hub_name, acl_mode, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (peer_hash, group_id, destination, hub_name, acl_mode, now)
+                    for group_id, (destination, acl_mode) in groups.items()
+                ],
+            )
+            self._db.executemany(
+                "INSERT INTO peer_members (peer_hash, group_id, user_hash, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    (peer_hash, group_id, user_hash, now)
+                    for group_id, user_hashes in members.items()
+                    for user_hash in user_hashes
+                ],
+            )
+            self._db.commit()
+
+    def list_peer_groups(self, group_id: str | None = None) -> list[PeerGroup]:
+        query = "SELECT * FROM peer_groups"
+        params: list[object] = []
+        if group_id is not None:
+            query += " WHERE group_id = ?"
+            params.append(group_id)
+        query += " ORDER BY group_id, hub_name"
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+        return [
+            PeerGroup(
+                peer_hash=row["peer_hash"],
+                group_id=row["group_id"],
+                destination_hash=row["destination_hash"],
+                hub_name=row["hub_name"],
+                acl_mode=row["acl_mode"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    def list_peer_members(self, peer_hash: bytes, group_id: str) -> list[bytes]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT user_hash FROM peer_members WHERE peer_hash = ? AND group_id = ?",
+                (peer_hash, group_id),
+            ).fetchall()
+        return [row["user_hash"] for row in rows]
+
+    def is_peer_member(self, group_id: str, user_hash: bytes) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM peer_members WHERE group_id = ? AND user_hash = ? LIMIT 1",
+                (group_id, user_hash),
+            ).fetchone()
+        return row is not None
+
+    # -- adoptions -------------------------------------------------------
+
+    def adopt(self, peer_hash: bytes, group_id: str, user_hashes: Sequence[bytes]) -> list[bytes]:
+        """Start serving a peer's members. Returns the ones newly adopted."""
+        adopted = []
+        now = time.time()
+        with self._lock:
+            for user_hash in user_hashes:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO adoptions (peer_hash, group_id, user_hash, adopted_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (peer_hash, group_id, user_hash, now),
+                )
+                if cursor.rowcount > 0:
+                    adopted.append(user_hash)
+            self._db.commit()
+        return adopted
+
+    def release_peer(self, peer_hash: bytes) -> list[tuple[str, bytes]]:
+        """Stop serving a peer's members. Returns what was released."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT group_id, user_hash FROM adoptions WHERE peer_hash = ?", (peer_hash,)
+            ).fetchall()
+            self._db.execute("DELETE FROM adoptions WHERE peer_hash = ?", (peer_hash,))
+            self._db.commit()
+        return [(row["group_id"], row["user_hash"]) for row in rows]
+
+    def adopted_peers(self) -> list[bytes]:
+        with self._lock:
+            rows = self._db.execute("SELECT DISTINCT peer_hash FROM adoptions").fetchall()
+        return [row["peer_hash"] for row in rows]
+
+    def list_adopted(self, group_id: str) -> list[bytes]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT DISTINCT user_hash FROM adoptions WHERE group_id = ?", (group_id,)
+            ).fetchall()
+        return [row["user_hash"] for row in rows]
+
+    def is_adopted(self, group_id: str, user_hash: bytes) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM adoptions WHERE group_id = ? AND user_hash = ? LIMIT 1",
+                (group_id, user_hash),
+            ).fetchone()
+        return row is not None
+
+    # -- notice queue ----------------------------------------------------
+
+    def enqueue_notice(
+        self,
+        group_id: str,
+        recipient_hash: bytes,
+        body: str,
+        source: str = SOURCE_GROUP,
+    ) -> bool:
+        now = time.time()
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO notice_queue"
+                " (source, group_id, recipient_hash, body, attempts, next_attempt_at, created_at)"
+                " VALUES (?, ?, ?, ?, 0, ?, ?)",
+                (source, group_id, recipient_hash, body, now, now),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def due_notices(self, limit: int, now: float | None = None) -> list[NoticeItem]:
+        now = time.time() if now is None else now
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM notice_queue WHERE next_attempt_at <= ?"
+                " ORDER BY next_attempt_at, id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+        return [
+            NoticeItem(
+                item_id=row["id"],
+                source=row["source"],
+                group_id=row["group_id"],
+                recipient_hash=row["recipient_hash"],
+                body=row["body"],
+                attempts=row["attempts"],
+            )
+            for row in rows
+        ]
+
+    def notice_depth(self) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT COUNT(*) AS depth FROM notice_queue").fetchone()
+        return int(row["depth"])
+
+    def complete_notice(self, item_id: int) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM notice_queue WHERE id = ?", (item_id,))
+            self._db.commit()
+
+    def defer_notice(self, item_id: int, delay: float, count_attempt: bool = True) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE notice_queue SET attempts = attempts + ?, next_attempt_at = ?"
+                " WHERE id = ?",
+                (1 if count_attempt else 0, time.time() + delay, item_id),
+            )
+            self._db.commit()
+
+    # -- flags -----------------------------------------------------------
+
+    def get_flag(self, key: str) -> bool:
+        return self._meta_get(f"flag_{key}") == b"1"
+
+    def set_flag(self, key: str, value: bool) -> None:
+        self._meta_set(f"flag_{key}", b"1" if value else b"0")
 
     def _group_from_row(self, row: sqlite3.Row) -> GroupRecord:
         return GroupRecord(
