@@ -160,6 +160,78 @@ def test_backoff_grows_and_is_capped(tmp_path, monkeypatch):
     assert scheduler._backoff(9) == 50
 
 
+def test_a_notice_goes_out_before_queued_reflections(tmp_path, monkeypatch):
+    config = HubConfig()
+    config.egress.tokens_per_second = 0.0
+    config.egress.burst = 1
+    scheduler, store, router, _record = build(tmp_path, monkeypatch, config=config)
+    store.enqueue_notice(GROUP, MEMBER, "your hub moved")
+    monkeypatch.setattr(
+        scheduler.hub, "build_notice", lambda group_id, identity, body: _stub_message()
+    )
+
+    scheduler.tick()
+
+    assert len(router.sent) == 1
+    assert store.egress_depth() == 1
+    assert store.notice_depth() == 1
+
+
+def test_a_notice_stays_queued_until_it_is_delivered(tmp_path, monkeypatch):
+    scheduler, store, router, _record = build(tmp_path, monkeypatch)
+    store.enqueue_notice(GROUP, MEMBER, "your hub moved")
+    sent = _stub_message()
+    monkeypatch.setattr(scheduler.hub, "build_notice", lambda group_id, identity, body: sent)
+
+    scheduler.tick()
+
+    assert store.notice_depth() == 1
+    sent.delivered(sent)
+    assert store.notice_depth() == 0
+
+
+def test_a_notice_for_an_unknown_identity_waits_for_a_path(tmp_path, monkeypatch):
+    scheduler, store, router, _record = build(tmp_path, monkeypatch, identity=None)
+    store.enqueue_notice(GROUP, MEMBER, "your hub moved")
+
+    scheduler.tick()
+
+    assert router.sent == []
+    assert store.due_notices(10, now=2**31)[0].attempts == 0
+
+
+def test_notice_attempts_are_capped(tmp_path, monkeypatch):
+    config = HubConfig()
+    config.egress.max_attempts = 2
+    scheduler, store, router, _record = build(tmp_path, monkeypatch, config=config)
+    store.enqueue_notice(GROUP, MEMBER, "your hub moved")
+
+    item = store.due_notices(1)[0]
+    store.defer_notice(item.item_id, -1)
+    store.defer_notice(item.item_id, -1)
+    scheduler.tick()
+
+    assert store.notice_depth() == 0
+
+
+class StubMessage:
+    """Enough of LXMessage for the scheduler: a method slot and two callbacks."""
+
+    def __init__(self):
+        self.desired_method = None
+        self.delivered = None
+
+    def register_delivery_callback(self, callback):
+        self.delivered = callback
+
+    def register_failed_callback(self, callback):
+        pass
+
+
+def _stub_message():
+    return StubMessage()
+
+
 def _first_hash(store):
     return store.group_history(GROUP)[0].msg_hash
 

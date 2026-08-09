@@ -79,6 +79,17 @@ Every key is optional. The values below are the built-in defaults.
     "link_timeout_sec": 30,
     "request_timeout_sec": 20,
     "max_fetch_batch": 256
+  },
+  "failover": {
+    "enabled": true,
+    "peer_timeout_sec": 1800,
+    "check_interval_sec": 60,
+    "notify_clients": true,
+    "notify_isolation": true
+  },
+  "directory": {
+    "enabled": true,
+    "min_reply_interval_sec": 60
   }
 }
 ```
@@ -99,10 +110,12 @@ Commands are the CLI verbs, sent as ordinary message text from an allowed hash:
 groups                          ->  ops   invite   3 member(s)   b196e0eb...
 create-group nets --acl public  ->  nets  public   7d41c9a2...
 add-member ops 8f1c0d7a...      ->  8f1c0d7a... is member in ops
-status                          ->  groups 2, egress_queue 0, control 707a7f49...
+status                          ->  groups 2, egress_queue 0, notice_queue 0, control 707a7f49...
+peers                           ->  9d2f0c81... last answered 4m ago   3 member(s) known
+                                      ops   Standby Hub   7d41c9a2...
 ```
 
-`create-group`, `groups`, `set-acl`, `add-member`, `remove-member`, `members`, and `status` are reachable. `run` is not, and anything outside that set comes back as a list of what is. Argument errors, unknown groups, and malformed hashes are answered as text instead of raising, because there's no terminal on the other end to read a traceback. Commands write to SQLite and the daemon hot-loads them, so a group created from a phone is announcing within 30 seconds.
+`create-group`, `groups`, `set-acl`, `add-member`, `remove-member`, `members`, `status`, and `peers` are reachable. `run` is not, and anything outside that set comes back as a list of what is. Argument errors, unknown groups, and malformed hashes are answered as text instead of raising, because there's no terminal on the other end to read a traceback. Commands write to SQLite and the daemon hot-loads them, so a group created from a phone is announcing within 30 seconds.
 
 A message on the control destination from a hash that isn't an operator, or one whose signature didn't validate, is logged at notice level and dropped with no reply. Replies go out directly rather than through the client egress queue, since two packets to one operator shouldn't spend tokens meant for keeping group reflections off a saturated RF interface.
 
@@ -167,6 +180,10 @@ Only epochs whose roots differ are walked, and the walk descends 8 levels asking
 
 Peering is mutual and explicit. A request from an identity whose federation destination hash isn't in `federation.peers` is refused, and `epoch_seconds` and `merkle_depth` have to match on both sides or the peer returns a null root set and logs that the parameters were rejected. Hubs don't need to share an at-rest encryption key, since hashes are computed over plaintext.
 
+Groups don't propagate with the peering. A hub reconciles only the group ids it already hosts locally, and records for anything else are dropped on ingest, so a group an operator creates on one hub stays there until an operator on the other hub creates the same id. A hub added to an existing federation starts empty and pulls history only for the groups its own operator asked for. Peering isn't transitive either: naming hub B doesn't federate you with B's peers, because B's peers check their own lists and don't have you on them.
+
+The pairing is by RNS identity, but group identity is the group id string, so two operators who both call a group `ops` and later peer with each other for some other group would reconcile both. Peering is explicit enough that this takes a deliberate act, and a distinctive id avoids it entirely.
+
 Backfill falls out of the same mechanism. A hub joining a group that already has history holds an empty tree, so every populated epoch diverges at the root and gets pulled in full. On the testnet, hub c started after hub a already held 3 messages, logged `Ingested 3 message(s)`, and delivered all three to its local member.
 
 `retention_epochs` bounds history at both ends: 168 hourly epochs is 7 days, older messages are pruned hourly, and epochs older than the window are skipped during sync so a pruned hub doesn't re-download what it just deleted.
@@ -185,9 +202,47 @@ Every encryptable column carries a one byte frame, `0x00` for plaintext and `0x0
 
 This protects a stolen disk, a copied backup, or a decommissioned SD card. It does not protect a live compromised host, because the daemon holds the key in memory for as long as it runs. Root on a running hub reads group traffic either way.
 
+## When a hub goes offline
+
+A group's destination hash comes from that hub's own identity, so the same group on two federated hubs has two addresses, and nothing in RNS or LXMF can tell an unmodified client to switch. What's built is the honest version of failover: the surviving hub keeps delivering, and tells the human where to post.
+
+Each sync round now also exchanges `/fed/state`, where a hub reports its name, the groups it hosts, their destination hashes, and their member hashes. Liveness is the last round a peer actually answered, not the last one this hub tried, since a hub records every attempt including the failures. A peer silent for `peer_timeout_sec`, 1800 seconds or six sync intervals, is treated as down from this hub's point of view. That's local evidence, not a claim about the rest of the network.
+
+Three things then happen, all of them queued in SQLite and paced by the same token bucket as reflections, so adopting 40 members doesn't dump 40 messages onto an RF interface:
+
+* **Adoption.** For groups it hosts too, the surviving hub starts delivering to the silent peer's members and sends each one a line naming the address to post to. Their posts are accepted even in an invite-only group, because a member of the group on a peer is a member of the group; a locally banned hash stays banned. They keep receiving either way, so the switch only matters when they want to send.
+
+  ```
+  ops: your hub (Home Hub) has not answered this hub for 30m. Standby Hub is
+  serving ops in the meantime. To post, add this contact: 7d41c9a2....
+  You keep receiving messages here either way.
+  ```
+
+* **Hand-back.** The peer answers again, adoption rows are released, and the same members are told the original address is live. Adoption state lives in SQLite, so a restart in the middle of an outage neither re-notifies nor forgets.
+
+* **Isolation.** When a hub can reach none of its peers, its own members are told that local traffic still works but may not be crossing to the other hubs, with the other hubs' addresses for that group and how long ago each was seen. Both directions of that transition are announced once, not once per check.
+
+The overlap is worth stating plainly: while two hubs are serving the same member, a message can arrive twice, because dedup is per hub on ingest and neither hub dedups on the client's behalf. A member who adds the standby and keeps the original contact will see duplicates for the length of the outage.
+
+## Endpoint directory
+
+An announce carries one destination and says nothing about the others, so there's a separate LXMF destination that answers any signed message with the endpoints this hub knows about. It runs on its own identity, since the hub identity's delivery destination is already the operator control channel.
+
+```
+ops     invite  Example Hub  b196e0eb...  here
+ops     invite  Standby Hub  7d41c9a2...  seen 5m ago
+nets    public  Example Hub  9c2f4a10...  here
+```
+
+Peer lines come from `/fed/state` gossip, so the age is when this hub last heard that hub say so. It isn't a liveness check, and a listed address can be dead. Most clients have a ping or path tool, which settles that against the hash in the listing better than this hub can.
+
+Answers are queued and paced like any other client egress, and repeat queries from the same hash inside `min_reply_interval_sec` are dropped, so the directory can't be used to make a hub transmit on demand. Unsigned messages are dropped. The listing covers 40 groups.
+
 ## What this doesn't do
 
-A group's destination hash comes from that hub's own identity, so the same group on two federated hubs has two addresses. Federation keeps the message sets equal; it doesn't give a client one address that survives a hub dying. If the hub a member holds as a contact goes offline, their messages fail in their own LXMF queue and nothing tells them where else to go. Failover that unmodified clients can act on needs either a notice-and-adopt scheme between peers or a group key replicated across hubs, and neither is built.
+Failover is a notice, not a redirect. A member has to add the standby contact themselves, and a client with no one at either address just fails in its own outbound queue as before. Transparent failover would need the group's private key on every hub, which trades the group's forward secrecy and blast radius for saving the member one paste; that isn't built.
+
+Adoption also can't help a group only one hub hosts. A hub serves a silent peer's members only for group ids it hosts itself, since it has nowhere to reflect them otherwise.
 
 ## Crash consistency
 
@@ -196,11 +251,13 @@ SQLite runs with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=300
 ## Tests
 
 ```bash
-pytest -q      # 74 tests
+pytest -q      # 130 tests
 ruff check .
 ```
 
 The suite covers WAL mode, dedup, hub-independent hashing, ACL enforcement for all three roles, author-field stripping, token bucket pacing, backoff growth and its ceiling, attempt capping, propagation versus direct method selection, wrong-key detection, exact Merkle traversal against a known missing set, multi-epoch backfill, peer rejection on mismatched parameters, and the control path including refusal of non-operators, unsigned messages, and verbs outside the remote allowlist.
+
+Failover and the directory add: liveness measured from answers rather than attempts, adoption restricted to locally hosted groups and idempotent across checks, peer members admitted to an invite-only group while banned hashes stay out, member sets withdrawn when a peer drops them, hand-back and both isolation transitions firing once each, notices surviving a reopen of the database, and directory listings, per-requester rate limiting, and unsigned queries.
 
 `tools/local_testnet.py` runs each role as a separate Reticulum instance over localhost TCP, with its own config directory, its own TCP interface, and `share_instance = No`, so reflection, egress, and federation are exercised over real RNS packets rather than in-process fakes:
 

@@ -15,5 +15,16 @@
     "sync_interval_sec": 300,
     "epoch_seconds": 3600,
     "merkle_depth": 8
+  },
+  "failover": {
+    "enabled": true,
+    "peer_timeout_sec": 1800,
+    "check_interval_sec": 60,
+    "notify_clients": true,
+    "notify_isolation": true
+  },
+  "directory": {
+    "enabled": true,
+    "min_reply_interval_sec": 60
   }
 }

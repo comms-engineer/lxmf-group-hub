@@ -13,6 +13,12 @@ One sync round with a peer:
    in the differing buckets, and subtract what we already have.
 4. ``/fed/fetch``  -- ask for the missing messages; the peer answers with an RNS
    Resource carrying the batch, which is ingested into the local store.
+
+``/fed/state`` runs alongside as the round's first request. It carries what the
+peer serves rather than what it holds: hub name, one destination hash per group,
+and the member set of each group. That's what lets a hub answer directory
+queries with other hubs' addresses, and lets a standby serve the members of a
+hub that stopped answering.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ import msgpack
 import RNS
 
 from .config import HubConfig
+from .destinations import group_destination_hash
 from .hub import GroupHub
 from .merkle import PrefixMerkleTree, children_of, diverging_nodes
 from .store import Store
@@ -37,6 +44,7 @@ PATH_ROOTS = "/fed/roots"
 PATH_TREE = "/fed/tree"
 PATH_BUCKET = "/fed/bucket"
 PATH_FETCH = "/fed/fetch"
+PATH_STATE = "/fed/state"
 
 PROTOCOL_VERSION = 1
 
@@ -85,6 +93,7 @@ class FederationEngine:
             (PATH_TREE, self._serve_tree),
             (PATH_BUCKET, self._serve_bucket),
             (PATH_FETCH, self._serve_fetch),
+            (PATH_STATE, self._serve_state),
         ):
             self.destination.register_request_handler(
                 path, response_generator=handler, allow=RNS.Destination.ALLOW_ALL
@@ -210,6 +219,27 @@ class FederationEngine:
         )
         return [len(records)]
 
+    def _serve_state(self, path, data, request_id, remote_identity, requested_at):
+        """Tell a peer which groups this hub serves, and to whom.
+
+        Member hashes leave the hub here. A configured peer already receives
+        every message and every sender hash for the groups it shares, so this
+        exposes nothing to it that federation did not already.
+        """
+        if not self._peer_allowed(remote_identity):
+            return None
+        groups: dict[str, list[Any]] = {}
+        members: dict[str, list[bytes]] = {}
+        for group in self.store.list_groups():
+            groups[group.group_id] = [
+                group_destination_hash(group.identity_key),
+                group.acl_mode,
+            ]
+            members[group.group_id] = [
+                user_hash for user_hash, _role in self.store.list_members(group.group_id)
+            ]
+        return [PROTOCOL_VERSION, self.config.hub_name, groups, members]
+
     def _push_resource(self, link: RNS.Link, payload: bytes) -> None:
         """Bulk state moves as a Resource, never as individual LXMF packets."""
         RNS.Resource(payload, link)
@@ -232,6 +262,7 @@ class FederationEngine:
 
         try:
             link.identify(self.identity)
+            self._exchange_state(link, peer_hash)
             response = self._request(
                 link,
                 PATH_ROOTS,
@@ -254,6 +285,7 @@ class FederationEngine:
                 ingested += self._reconcile_group(link, state, group_id, remote_roots)
 
             self.store.record_peer_sync(peer_hash, None)
+            self.store.record_peer_success(peer_hash)
             if ingested:
                 RNS.log(
                     f"Ingested {ingested} message(s) from {RNS.prettyhexrep(peer_hash)}",
@@ -262,6 +294,31 @@ class FederationEngine:
             return ingested
         finally:
             link.teardown()
+
+    def _exchange_state(self, link: RNS.Link, peer_hash: bytes) -> None:
+        """Record what the peer serves. A failure here must not abort the sync."""
+        try:
+            response = self._request(link, PATH_STATE, [PROTOCOL_VERSION])
+        except Exception as exception:
+            RNS.log(f"Could not read peer state: {exception}", RNS.LOG_DEBUG)
+            return
+        if not response or response[0] != PROTOCOL_VERSION:
+            return
+        # The peer answered, which is the evidence failover waits for.
+        self.store.record_peer_success(peer_hash)
+        _version, hub_name, groups, members = response
+        self.store.record_peer_state(
+            peer_hash,
+            str(hub_name),
+            {
+                str(group_id): (bytes(destination), str(acl_mode))
+                for group_id, (destination, acl_mode) in groups.items()
+            },
+            {
+                str(group_id): [bytes(item) for item in hashes]
+                for group_id, hashes in members.items()
+            },
+        )
 
     def _reconcile_group(
         self, link: RNS.Link, state: SyncState, group_id: str, remote_roots: dict[int, bytes]

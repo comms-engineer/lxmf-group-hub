@@ -16,8 +16,9 @@ import RNS
 
 from .config import HubConfig
 from .destinations import VirtualDestinationManager
+from .directory import DirectoryChannel
 from .hub import GroupHub
-from .store import EgressItem, Store
+from .store import SOURCE_DIRECTORY, SOURCE_GROUP, EgressItem, NoticeItem, Store
 
 
 class TokenBucket:
@@ -58,12 +59,14 @@ class EgressScheduler:
         hub: GroupHub,
         router: LXMF.LXMRouter,
         destinations: VirtualDestinationManager,
+        directory: DirectoryChannel | None = None,
     ):
         self.config = config
         self.store = store
         self.hub = hub
         self.router = router
         self.destinations = destinations
+        self.directory = directory
         self.bucket = TokenBucket(config.egress.tokens_per_second, config.egress.burst)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -88,10 +91,24 @@ class EgressScheduler:
             self._stop.wait(idle)
 
     def tick(self) -> float:
-        """Send what is due and allowed. Returns how long to sleep next."""
+        """Send what is due and allowed. Returns how long to sleep next.
+
+        Notices go first. They are short, they say where a group moved, and they
+        are worthless once the reflections they explain have already arrived.
+        They spend the same tokens as reflections, so an adoption of 40 members
+        cannot dump 40 messages onto an RF interface at once.
+        """
+        notices = self.store.due_notices(self.config.egress.batch_size)
         items = self.store.due_egress(self.config.egress.batch_size)
-        if not items:
+        if not notices and not items:
             return 2.0
+
+        for notice in notices:
+            if self._stop.is_set():
+                return 0.5
+            if not self.bucket.consume():
+                return max(0.5, self.bucket.time_until())
+            self.send_notice(notice)
 
         for item in items:
             if self._stop.is_set():
@@ -155,6 +172,63 @@ class EgressScheduler:
                 f" {exception}",
                 RNS.LOG_ERROR,
             )
+
+    def send_notice(self, notice: NoticeItem) -> None:
+        if notice.attempts >= self.config.egress.max_attempts:
+            RNS.log(
+                f"Giving up on notice to {RNS.prettyhexrep(notice.recipient_hash)}"
+                f" after {notice.attempts} attempts",
+                RNS.LOG_WARNING,
+            )
+            self.store.complete_notice(notice.item_id)
+            return
+
+        if notice.source == SOURCE_GROUP:
+            if self.destinations.destination_for(notice.group_id) is None:
+                # The group is gone or not attached yet. Try again later.
+                self.store.defer_notice(notice.item_id, self.config.egress.retry_backoff_sec)
+                return
+        elif self.directory is None:
+            # A directory answer queued before the directory was switched off.
+            self.store.complete_notice(notice.item_id)
+            return
+
+        identity = RNS.Identity.recall(notice.recipient_hash)
+        if identity is None:
+            if not RNS.Transport.has_path(notice.recipient_hash):
+                RNS.Transport.request_path(notice.recipient_hash)
+            self.store.defer_notice(
+                notice.item_id, self.config.egress.path_request_grace_sec, count_attempt=False
+            )
+            return
+
+        try:
+            message = self._build_notice(notice, identity)
+        except Exception as exception:
+            RNS.log(f"Could not build notice: {exception}", RNS.LOG_ERROR)
+            self.store.defer_notice(notice.item_id, self._backoff(notice.attempts))
+            return
+
+        message.desired_method = self._desired_method()
+        message.register_delivery_callback(
+            lambda _message: self.store.complete_notice(notice.item_id)
+        )
+        self.store.defer_notice(notice.item_id, self._backoff(notice.attempts))
+        try:
+            self.router.handle_outbound(message)
+        except Exception as exception:
+            RNS.log(
+                f"Outbound handling failed for notice to"
+                f" {RNS.prettyhexrep(notice.recipient_hash)}: {exception}",
+                RNS.LOG_ERROR,
+            )
+
+    def _build_notice(self, notice: NoticeItem, identity: RNS.Identity) -> LXMF.LXMessage:
+        if notice.source == SOURCE_DIRECTORY:
+            if self.directory is None:
+                raise ValueError("The directory is not running")
+            return self.directory.build_reply(identity, notice.body)
+        return self.hub.build_notice(notice.group_id, identity, notice.body)
 
     def _desired_method(self) -> int:
         if self.config.egress.prefer_propagation and self.router.get_outbound_propagation_node():
