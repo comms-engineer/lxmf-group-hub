@@ -187,6 +187,61 @@ def test_hand_back_happens_once(tmp_path):
     assert engine.release(PEER) == 0
 
 
+def restarted(engine, store, at):
+    """A second engine over the same database, as a restart of the daemon is."""
+    fresh = FailoverEngine(engine.config, store, engine.hub)
+    fresh.started_at = at
+    return fresh
+
+
+def test_a_restart_mid_outage_neither_hands_back_nor_re_notifies(tmp_path):
+    """A restart is evidence about this hub, not about the peer.
+
+    The peer's last answer is older than the timeout and stays that way, so
+    measuring from a fresh startup would read a long-dead peer as freshly alive,
+    release the adoption and send a hand-back naming an address still down.
+    """
+    engine, store = build(tmp_path, notify_isolation=True)
+    gossip(store)
+    answered(store, engine.started_at)
+    engine.check(now=engine.started_at + 1801)
+    for item in store.due_notices(50, now=2**31):
+        store.complete_notice(item.item_id)
+    assert store.list_adopted(GROUP) == [REMOTE_MEMBER]
+
+    after = restarted(engine, store, engine.started_at + 1900)
+    after.check(now=after.started_at + 10)
+
+    assert store.list_adopted(GROUP) == [REMOTE_MEMBER]
+    assert store.get_flag(FLAG_ISOLATED)
+    assert bodies(store) == []
+
+
+def test_a_peer_that_answers_after_a_restart_is_still_handed_back(tmp_path):
+    engine, store = build(tmp_path)
+    gossip(store)
+    engine.check(now=engine.started_at + 1801)
+    for item in store.due_notices(50, now=2**31):
+        store.complete_notice(item.item_id)
+
+    after = restarted(engine, store, engine.started_at + 1900)
+    answered(store, after.started_at + 10)
+    after.check(now=after.started_at + 20)
+
+    assert store.list_adopted(GROUP) == []
+    assert len(bodies(store)) == 1
+
+
+def test_a_peer_still_silent_after_the_restart_window_is_stale_again(tmp_path):
+    engine, store = build(tmp_path)
+    answered(store, engine.started_at)
+
+    after = restarted(engine, store, engine.started_at + 1900)
+
+    assert after.stale_peers(now=after.started_at + 10) == []
+    assert after.stale_peers(now=after.started_at + 1801) == [PEER]
+
+
 # -- isolation -----------------------------------------------------------
 
 

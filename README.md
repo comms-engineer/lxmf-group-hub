@@ -218,7 +218,7 @@ Three things then happen, all of them queued in SQLite and paced by the same tok
   You keep receiving messages here either way.
   ```
 
-* **Hand-back.** The peer answers again, adoption rows are released, and the same members are told the original address is live. Adoption state lives in SQLite, so a restart in the middle of an outage neither re-notifies nor forgets.
+* **Hand-back.** The peer answers again, adoption rows are released, and the same members are told the original address is live. Adoption state lives in SQLite, so a restart in the middle of an outage neither re-notifies nor forgets: for the first `peer_timeout_sec` after startup a silent peer is neither up nor down, because this hub hasn't yet had as long to reach it as it gives itself before calling a peer dead. Nothing is adopted or released in that window.
 
 * **Isolation.** When a hub can reach none of its peers, its own members are told that local traffic still works but may not be crossing to the other hubs, with the other hubs' addresses for that group and how long ago each was seen. Both directions of that transition are announced once, not once per check.
 
@@ -251,7 +251,7 @@ SQLite runs with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=300
 ## Tests
 
 ```bash
-pytest -q      # 130 tests
+pytest -q      # 134 tests
 ruff check .
 ```
 

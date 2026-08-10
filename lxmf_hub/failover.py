@@ -9,7 +9,9 @@ contact the client already has, naming the hash to add.
 The liveness signal is the last federation round a peer actually answered, not
 the last one this hub attempted. A peer silent for ``peer_timeout_sec`` is
 treated as down, which is a statement about this hub's vantage point and not a
-claim that the peer is unreachable from anywhere else.
+claim that the peer is unreachable from anywhere else. For the same window after
+this hub's own startup a silent peer is neither up nor down, since a restart says
+nothing about anybody else.
 
 Three events produce a notice:
 
@@ -37,6 +39,10 @@ from .store import Store
 
 FLAG_ISOLATED = "isolated"
 
+LIVE = "live"
+STALE = "stale"
+UNKNOWN = "unknown"
+
 
 def format_age(seconds: float) -> str:
     if seconds < 120:
@@ -59,20 +65,29 @@ class FailoverEngine:
 
     # -- liveness --------------------------------------------------------
 
-    def peer_reference(self, peer_hash: bytes) -> float:
-        """When this hub last had evidence the peer was up.
+    def peer_status(self, peer_hash: bytes, now: float | None = None) -> str:
+        """What this hub can say about a peer: ``LIVE``, ``STALE`` or ``UNKNOWN``.
 
-        A peer never reached since startup counts from startup, not from the
-        epoch, so a hub that boots into an ongoing outage still adopts after one
-        timeout instead of adopting immediately.
+        A restart is not evidence about a peer. For the first ``peer_timeout_sec``
+        after startup a silent peer is ``UNKNOWN`` rather than either, because
+        this hub has not yet had as long to reach it as it gives itself before
+        calling a peer dead. Treating that window as ``LIVE`` would release an
+        adoption made before the restart and send a hand-back naming an address
+        that is still down; treating it as ``STALE`` would adopt on the strength
+        of a timestamp written before the hub went down.
         """
-        last_success = self.store.peer_last_success(peer_hash) or 0.0
-        return max(last_success, self.started_at)
+        now = time.time() if now is None else now
+        timeout = self.config.failover.peer_timeout_sec
+        last_success = self.store.peer_last_success(peer_hash)
+        if last_success is not None and now - last_success <= timeout:
+            return LIVE
+        if now - self.started_at <= timeout:
+            return UNKNOWN
+        return STALE
 
     def stale_peers(self, now: float | None = None) -> list[bytes]:
         now = time.time() if now is None else now
-        timeout = self.config.failover.peer_timeout_sec
-        return [peer for peer in self._peers if now - self.peer_reference(peer) > timeout]
+        return [peer for peer in self._peers if self.peer_status(peer, now) == STALE]
 
     # -- main loop -------------------------------------------------------
 
@@ -86,15 +101,16 @@ class FailoverEngine:
 
     def check(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        stale = set(self.stale_peers(now))
+        statuses = {peer: self.peer_status(peer, now) for peer in self._peers}
 
-        for peer_hash in self._peers:
-            if peer_hash in stale:
+        for peer_hash, status in statuses.items():
+            if status == STALE:
                 self.adopt_peer(peer_hash)
-            elif peer_hash in set(self.store.adopted_peers()):
+            elif status == LIVE and peer_hash in set(self.store.adopted_peers()):
                 self.release(peer_hash)
 
-        self.check_isolation(stale)
+        if UNKNOWN not in statuses.values():
+            self.check_isolation({peer for peer, s in statuses.items() if s == STALE})
 
     # -- adoption --------------------------------------------------------
 
