@@ -286,3 +286,69 @@ def _stub_outbound(monkeypatch):
     monkeypatch.setattr("RNS.Identity.recall", staticmethod(lambda _hash: SimpleNamespace()))
     monkeypatch.setattr("lxmf_hub.directory.RNS.Destination", FakeDestination)
     monkeypatch.setattr("lxmf_hub.directory.LXMF.LXMessage", FakeMessage)
+
+
+class StartDestination:
+    """Stands in for the destination ``start`` builds, which needs a live RNS."""
+
+    IN = 0
+    SINGLE = 2
+    hexrep = staticmethod(RNS.hexrep)
+
+    def __init__(self, identity, direction, destination_type, app_name, aspect):
+        self.identity = identity
+        self.direction = direction
+        self.hash = b"\xdd" * 16
+        self.ratchet_path = None
+        self.packet_callback = None
+        self.link_callback = None
+        self.app_data = None
+
+    def enable_ratchets(self, path):
+        self.ratchet_path = path
+
+    def set_packet_callback(self, callback):
+        self.packet_callback = callback
+
+    def set_link_established_callback(self, callback):
+        self.link_callback = callback
+
+    def set_default_app_data(self, callable_or_data):
+        self.app_data = callable_or_data
+
+
+class RegisteringRouter(StubRouter):
+    def __init__(self, ratchetpath):
+        super().__init__()
+        self.ratchetpath = ratchetpath
+        self.delivery_destinations = {}
+
+    def delivery_packet(self, *args):
+        pass
+
+    def delivery_link_established(self, *args):
+        pass
+
+    def get_announce_app_data(self, destination_hash):
+        return b""
+
+
+def test_the_directory_destination_carries_what_lxmf_reads_on_delivery(tmp_path, monkeypatch):
+    """LXMF reads ``destination.stamp_cost`` for every inbound message.
+
+    ``register_delivery_identity`` sets it, and the directory cannot use that
+    call because the router allows one delivery identity and the control channel
+    holds it. Without the attribute, an inbound query raises inside LXMF.
+    """
+    config = HubConfig()
+    config.storage_path = str(tmp_path)
+    store = Store(str(tmp_path / "hub.db"))
+    router = RegisteringRouter(str(tmp_path / "ratchets"))
+    monkeypatch.setattr("lxmf_hub.directory.RNS.Destination", StartDestination)
+
+    destination = DirectoryChannel(config, store, router).start()
+
+    assert destination is not None
+    assert destination.stamp_cost is None
+    assert destination.ratchet_path is not None
+    assert router.delivery_destinations[destination.hash] is destination

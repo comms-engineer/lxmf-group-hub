@@ -69,9 +69,17 @@ class DirectoryChannel:
         destination = RNS.Destination(
             identity, RNS.Destination.IN, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery"
         )
+        os.makedirs(self.router.ratchetpath, exist_ok=True)
+        destination.enable_ratchets(
+            os.path.join(
+                self.router.ratchetpath,
+                f"{RNS.hexrep(destination.hash, delimit=False)}.ratchets",
+            )
+        )
         destination.set_packet_callback(self.router.delivery_packet)
         destination.set_link_established_callback(self.router.delivery_link_established)
         destination.display_name = f"{self.config.hub_name} directory"
+        destination.stamp_cost = None
         destination.set_default_app_data(
             lambda destination_hash=destination.hash: self.router.get_announce_app_data(
                 destination_hash

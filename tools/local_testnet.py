@@ -32,9 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import LXMF  # noqa: E402
 import RNS  # noqa: E402
 
-from lxmf_hub.cli import group_destination_hash  # noqa: E402
 from lxmf_hub.config import HubConfig  # noqa: E402
 from lxmf_hub.daemon import HubDaemon  # noqa: E402
+from lxmf_hub.destinations import group_destination_hash  # noqa: E402
 from lxmf_hub.store import ACL_INVITE, ACL_PUBLIC  # noqa: E402
 
 BASE = os.path.expanduser("~/.lxmf_hub_testnet")
