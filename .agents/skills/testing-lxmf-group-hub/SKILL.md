@@ -43,15 +43,68 @@ Wipe `rm -rf ~/.lxmf_hub_testnet` between scenarios. There is no auth/secret of 
    `python -m lxmf_hub.cli --config cfg.json run` for anything involving hot-load, SIGKILL/restart
    or supervision. The harness writes the Reticulum config, so boot the harness hub once to
    create the config + group, then switch to the real daemon on the same storage dir.
-5. **`pkill -f 'local_testnet'` will kill your own shell** (the pattern matches the shell's own
-   command line). Anchor it: `pkill -f '^python3 tools/local_testnet.py client --name m5'`.
-6. **Sending the same text twice is not a duplicate.** `msg_hash` =
+5. **Any `pkill -f <pattern>` whose pattern appears in your own command line kills your own shell.**
+   This bites for `local_testnet`, and also for config paths (`pkill -f 'config /tmp/x/hub-a.json'`
+   matches the `bash -c` wrapper that contains that string). Safest: `pgrep -af 'lxmf_hub.cli
+   --config'` in one call, then `kill -9 <pid>` by number in the next call.
+6. **Failover and the directory only tick in `HubDaemon.supervise()`**, and the harness hardcodes
+   its own `failover`/`directory` blocks, so use the real daemon with a hand-written JSON config
+   for any failover/directory work (see the choreography section below).
+7. **Sending the same text twice is not a duplicate.** `msg_hash` =
    sha256(group_hash|sender|timestamp|payload) and LXMF stamps a fresh timestamp per message. To
    exercise dedup you must send two LXMessages with an explicitly equal `message.timestamp`.
    Even then the hub's store-level dedup log may not fire: `LXMRouter.lxmf_delivery` drops
    retransmits first via `locally_delivered_transient_ids` (`LXMRouter.py`, `has_message`), so the
    hub delivery callback is never invoked twice. Assert the observable instead (stored once, not
    re-reflected), and exercise store dedup through repeated federation sync rounds.
+
+## Failover / directory / notice-queue testing (PR #4 onwards)
+
+Minimum viable topology: hub `a` (TCPServer 4242, transport) + hub `b` (4243, connects to 4242),
+each listing the other's `/fed` hash in `federation.peers`, group id `ops` **invite-only on both**,
+and **all clients connected to 4242 only** so killing `b` does not remove any client's network
+path. Give `a` two local members, `b` one peer-only member (the adoption subject), and one hash
+that is a member on `b` but `banned` on `a` (proves ban beats adoption).
+
+Use short timeouts or an outage takes 30 minutes:
+
+```json
+"failover": {"enabled": true, "peer_timeout_sec": 60, "check_interval_sec": 5,
+             "notify_clients": true, "notify_isolation": true},
+"directory": {"enabled": true, "min_reply_interval_sec": 60}
+```
+
+* **Gossip is the precondition for everything.** A peer's group destination and member set arrive
+  only via a successful `/fed/state` round, so wait for `cli peers` to show the peer with
+  `last answered <N>s ago` plus an indented `ops <hub_name> <dest hash>` line **before** killing it.
+* **Liveness vs sync are different columns.** `peers.last_sync_at` advances on *failed* rounds
+  (with `last_error`); only `peer_liveness.last_success_at` records an answer. Sample both from
+  SQLite during an outage — `peer_liveness` frozen while `peers` advances is the assertion.
+* **`FailoverEngine.peer_reference()` returns `max(last_success, started_at)`**, so a daemon
+  restart mid-outage makes a still-dead peer look freshly alive: expect a spurious
+  `Peer <x> answered again, releasing N adopted member(s)` + `connectivity restored` within seconds
+  of restart, adoption rows deleted, `flag_isolated` reset, then re-adoption one timeout later and
+  a second notice to every client. Always test "kill -9 the surviving hub while the peer is still
+  down" — it is the case unit tests cannot see. (Posting by the affected member still works,
+  because authorisation reads `peer_members`, which gossip persists independently of `adoptions`.)
+* **Exactly-once notices** are enforced by `notice_queue`'s `UNIQUE (recipient_hash, body)`, so
+  count *client-side* receipts across many check intervals, not queue rows.
+* **Directory pacing**: the reply is enqueued, and with a normal bucket it can drain in <2 s, so a
+  2 s poll will never see `notice_queue > 0`. Set `egress.tokens_per_second` to ~0.2 / `burst` 1 and
+  fire three queries from three clients at once, then poll `notice_queue` once per second: 3 → 2 →
+  1 → 0 at ~5 s spacing is the proof that replies are queued and token-bucketed, not inline.
+* **Directory identity** lives at `<storage_path>/directory_identity`; ratchet state lives under
+  `<storage_path>/lxmf/ratchets/<dest hash>.ratchets`. The `Directory on <hash>` log line must be
+  byte-identical across restarts even with ratchets enabled.
+* **LXMF reads attributes off any delivery destination** (`stamp_cost`, ratchets) on every inbound
+  message and announce. If a hand-built `RNS.Destination` is missing them, the daemon survives but
+  logs `Hub supervision error: 'Destination' object has no attribute 'stamp_cost'` once a second
+  and **the failover check never runs in that iteration**. Always grep hub logs for
+  `supervision error|AttributeError` and treat a non-zero count as a failure even when the feature
+  under test looks fine.
+* **Boot-into-outage**: a hub whose peer never answers must isolate one `peer_timeout_sec` after
+  *its own start* (not at t=0, not never), with `peer_liveness` empty. Adoption cannot be tested
+  for a never-seen peer — member sets only arrive by gossip.
 
 ## Useful commands
 
@@ -63,6 +116,12 @@ PYTHONUNBUFFERED=1 python3 tools/local_testnet.py client --name alice --connect 
 
 # operator CLI (safe against a live daemon; WAL)
 python3 -m lxmf_hub.cli --config cfg.json groups|members <gid>|add-member <gid> <hash>|status
+python3 -m lxmf_hub.cli --config cfg.json peers      # per-peer last-answer age + gossiped groups
+python3 -m lxmf_hub.cli --config cfg.json add-member ops <hash> --role banned
+
+# unencrypted failover/directory state is readable with plain sqlite3:
+#   peers, peer_liveness, peer_groups, peer_members, adoptions, notice_queue,
+#   meta (key 'flag_isolated')
 ```
 
 Payloads are encrypted at rest, so read content through `Store`, not raw SQL. A read-only
@@ -102,6 +161,20 @@ with framing byte `0x01` and contain no plaintext.
 * Good backfill test: seed hub A while peer hub C is *down* (register C's member in C's DB
   meanwhile), then start C and expect `Ingested N message(s)` plus N deliveries — proves
   anti-entropy rather than live-only propagation.
+
+## Screenshot evidence on a headless box
+
+There is no xterm/gnome-terminal; `konsole` is available on `DISPLAY=:0`. Write the evidence into
+a shell script first, then:
+
+```bash
+export DISPLAY=:0
+(nohup konsole --hide-menubar -e bash -c "bash /tmp/ev.sh; sleep 600" >/dev/null 2>&1 &)
+sleep 8; wmctrl -a Konsole; wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz
+```
+
+Each new konsole opens un-maximized and `wmctrl -a` may not raise it above Chrome — click its
+taskbar button, then re-issue the maximize, then screenshot.
 
 ## Devin Secrets Needed
 
