@@ -269,6 +269,10 @@ python tools/local_testnet.py client --name alice --connect 4242 --send-to <grou
 
 Hub b joins the federation with `--port 4243 --connect 4242 --peer <hub_a_federation_hash>`, where that hash is printed at hub a's startup. Set `TESTNET_LOGLEVEL=7` for per-message hub and federation output.
 
+## To-Do
+- More robust operator commands, including help
+- Per-user username setting, for message prefixes
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
