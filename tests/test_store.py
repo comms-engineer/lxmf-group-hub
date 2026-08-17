@@ -177,7 +177,8 @@ def test_a_failed_fan_out_leaves_the_message_unknown(tmp_path):
     store = make_store(tmp_path)
     record = make_message()
 
-    with pytest.raises(sqlite3.InterfaceError):
+    # InterfaceError on some sqlite3 builds, ProgrammingError on others.
+    with pytest.raises(sqlite3.Error):
         store.store_and_enqueue(record, [SENDER, object()])
 
     assert store.get_message(record.msg_hash) is None
