@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from lxmf_hub.store import (
@@ -149,3 +151,96 @@ def test_encrypted_database_refuses_plaintext_mode(tmp_path):
     reopened = Store(str(tmp_path / "hub.db"))
     with pytest.raises(ValueError):
         reopened.get_message(record.msg_hash)
+
+
+def test_a_message_and_its_fan_out_are_committed_together(tmp_path):
+    store = make_store(tmp_path)
+    record = make_message()
+    recipients = [SENDER, b"\x02" * 16]
+
+    assert store.store_and_enqueue(record, recipients) == (True, 2)
+    assert store.get_message(record.msg_hash) is not None
+    assert {item.recipient_hash for item in store.due_egress(10)} == set(recipients)
+
+
+def test_a_known_message_is_not_queued_again(tmp_path):
+    store = make_store(tmp_path)
+    record = make_message()
+    store.store_and_enqueue(record, [SENDER])
+
+    assert store.store_and_enqueue(record, [SENDER]) == (False, 0)
+    assert store.egress_depth() == 1
+
+
+def test_a_failed_fan_out_leaves_the_message_unknown(tmp_path):
+    """Otherwise the sender's retry is deduplicated against a message nobody has."""
+    store = make_store(tmp_path)
+    record = make_message()
+
+    with pytest.raises(sqlite3.InterfaceError):
+        store.store_and_enqueue(record, [SENDER, object()])
+
+    assert store.get_message(record.msg_hash) is None
+    assert store.egress_depth() == 0
+
+
+def test_pruning_removes_queue_rows_for_messages_that_are_gone(tmp_path):
+    store = make_store(tmp_path)
+    record = make_message(timestamp=10.0)
+    store.store_and_enqueue(record, [SENDER])
+
+    assert store.prune_messages(1000.0) == 1
+    assert store.egress_depth() == 0
+
+
+def test_a_grace_does_not_count_as_a_delivery_attempt(tmp_path):
+    store = make_store(tmp_path)
+    record = make_message()
+    store.store_and_enqueue(record, [SENDER])
+    item = store.due_egress(10)[0]
+
+    store.defer_egress(item.item_id, -1, count_attempt=False)
+    store.defer_egress(item.item_id, -1, count_attempt=False)
+    graced = store.due_egress(10)[0]
+    assert (graced.attempts, graced.graces) == (0, 2)
+
+    store.defer_egress(item.item_id, -1)
+    attempted = store.due_egress(10)[0]
+    assert (attempted.attempts, attempted.graces) == (1, 0)
+
+
+def test_operator_answers_are_queued_in_order_and_never_deduplicated(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue_control(SENDER, "same")
+    store.enqueue_control(SENDER, "same")
+
+    queued = store.due_control(10)
+    assert [item.body for item in queued] == ["same", "same"]
+    assert store.control_depth() == 2
+
+    store.defer_control(queued[0].item_id, 3600)
+    assert [item.item_id for item in store.due_control(10)] == [queued[1].item_id]
+
+    store.complete_control(queued[1].item_id)
+    assert store.control_depth() == 1
+
+
+def test_a_database_written_before_the_grace_column_still_opens(tmp_path):
+    """An upgrade must not strand a queue full of undelivered messages."""
+    path = str(tmp_path / "hub.db")
+    store = make_store(tmp_path)
+    record = make_message()
+    store.store_and_enqueue(record, [SENDER])
+    store._db.execute("ALTER TABLE egress_queue DROP COLUMN graces")
+    store._db.commit()
+    store.close()
+
+    reopened = Store(path)
+
+    assert reopened.due_egress(10)[0].graces == 0
+
+
+def test_the_shared_deferral_helper_refuses_a_table_it_does_not_own(tmp_path):
+    store = make_store(tmp_path)
+    with pytest.raises(ValueError):
+        store._defer("messages", 1, 1.0, True)

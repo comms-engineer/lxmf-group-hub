@@ -11,6 +11,7 @@ import os
 import signal
 import threading
 import time
+from functools import partial
 
 import LXMF
 import RNS
@@ -28,6 +29,23 @@ from .store import Store
 
 GROUP_RELOAD_INTERVAL = 30.0
 PRUNE_INTERVAL = 3600.0
+
+# RNS truncates destination hashes to 128 bits.
+DESTINATION_HASH_LENGTH = 16
+
+
+def _destination_hash(value: str) -> bytes:
+    """Parse a configured destination hash with an error naming the setting."""
+    try:
+        parsed = bytes.fromhex(value.strip())
+    except ValueError as exception:
+        raise ValueError(f"egress.propagation_node '{value}' is not hex") from exception
+    if len(parsed) != DESTINATION_HASH_LENGTH:
+        raise ValueError(
+            f"egress.propagation_node '{value}' is not a"
+            f" {DESTINATION_HASH_LENGTH}-byte destination hash"
+        )
+    return parsed
 
 
 def load_hub_identity(path: str) -> RNS.Identity:
@@ -88,7 +106,7 @@ class HubDaemon:
 
         propagation_node = self.config.egress.propagation_node
         if propagation_node:
-            self.router.set_outbound_propagation_node(bytes.fromhex(propagation_node))
+            self.router.set_outbound_propagation_node(_destination_hash(propagation_node))
             RNS.log(
                 f"Queueing client egress via propagation node {propagation_node}", RNS.LOG_NOTICE
             )
@@ -99,7 +117,13 @@ class HubDaemon:
         self.destinations.load_groups()
 
         self.egress = EgressScheduler(
-            self.config, self.store, self.hub, self.router, self.destinations, self.directory
+            self.config,
+            self.store,
+            self.hub,
+            self.router,
+            self.destinations,
+            self.directory,
+            self.control,
         )
         self.egress.start()
 
@@ -143,29 +167,42 @@ class HubDaemon:
         last_prune = time.time()
         while not self._stop.is_set():
             now = time.time()
-            try:
-                if now - last_reload >= GROUP_RELOAD_INTERVAL:
-                    last_reload = now
-                    for group_id in self.destinations.load_groups():
-                        RNS.log(f"Hot-loaded group '{group_id}'", RNS.LOG_NOTICE)
-                self.destinations.announce_due()
-                if self.control is not None:
-                    self.control.announce_due()
-                if self.directory is not None:
-                    self.directory.announce_due()
-                if self.failover is not None:
-                    self.failover.check_due(now)
-                if now - last_prune >= PRUNE_INTERVAL:
-                    last_prune = now
-                    pruned = self.hub.prune()
-                    if pruned:
-                        RNS.log(f"Pruned {pruned} expired message(s)", RNS.LOG_NOTICE)
-            except Exception as exception:
-                RNS.log(f"Hub supervision error: {exception}", RNS.LOG_ERROR)
-                RNS.trace_exception(exception)
+            # Each task is guarded on its own. Sharing one try block means a
+            # failure in an early task -- a group whose identity will not load,
+            # say -- silently skips failover checks and pruning for as long as it
+            # keeps failing, which is exactly when they are needed.
+            if now - last_reload >= GROUP_RELOAD_INTERVAL:
+                last_reload = now
+                self._guard("group hot-load", self._reload_groups)
+            self._guard("group announce", self.destinations.announce_due)
+            if self.control is not None:
+                self._guard("control announce", self.control.announce_due)
+            if self.directory is not None:
+                self._guard("directory announce", self.directory.announce_due)
+            if self.failover is not None:
+                self._guard("failover check", partial(self.failover.check_due, now))
+            if now - last_prune >= PRUNE_INTERVAL:
+                last_prune = now
+                self._guard("prune", self._prune)
             self._stop.wait(1.0)
 
         self.shutdown()
+
+    def _guard(self, task: str, action) -> None:
+        try:
+            action()
+        except Exception as exception:
+            RNS.log(f"Hub supervision error during {task}: {exception}", RNS.LOG_ERROR)
+            RNS.trace_exception(exception)
+
+    def _reload_groups(self) -> None:
+        for group_id in self.destinations.load_groups():
+            RNS.log(f"Hot-loaded group '{group_id}'", RNS.LOG_NOTICE)
+
+    def _prune(self) -> None:
+        pruned = self.hub.prune()
+        if pruned:
+            RNS.log(f"Pruned {pruned} expired message(s)", RNS.LOG_NOTICE)
 
     def _signal(self, signum, frame) -> None:
         RNS.log("Shutting down hub", RNS.LOG_NOTICE)

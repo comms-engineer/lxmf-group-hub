@@ -73,3 +73,20 @@ def test_paths_are_expanded(monkeypatch):
     assert config.resolved_storage_path == "/home/operator/hub"
     assert config.resolved_reticulum_config_path == "/home/operator/.reticulum"
     assert HubConfig().resolved_reticulum_config_path is None
+
+
+def test_peer_hashes_are_validated_where_they_are_read():
+    config = HubConfig()
+    config.federation.peers = ["0b" * 16, " " + "0c" * 16 + " "]
+
+    assert config.federation.peer_hashes == [b"\x0b" * 16, b"\x0c" * 16]
+
+
+@pytest.mark.parametrize("value", ["nonsense", "0b0b", "0b" * 17])
+def test_a_peer_that_is_not_a_destination_hash_is_rejected(value):
+    """A truncated or misspelled peer must not become a hash nothing matches."""
+    config = HubConfig()
+    config.federation.peers = [value]
+
+    with pytest.raises(ValueError):
+        _ = config.federation.peer_hashes

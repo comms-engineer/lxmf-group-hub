@@ -60,7 +60,7 @@ class FailoverEngine:
         self.store = store
         self.hub = hub
         self.started_at = time.time()
-        self._peers: list[bytes] = [bytes.fromhex(peer) for peer in config.federation.peers]
+        self._peers: list[bytes] = config.federation.peer_hashes
         self._last_check = 0.0
 
     # -- liveness --------------------------------------------------------
@@ -122,7 +122,14 @@ class FailoverEngine:
             members = self.store.list_peer_members(peer_hash, group.group_id)
             if not members:
                 continue
-            local = {user_hash for user_hash, _role in self.store.list_members(group.group_id)}
+            # Banned members count as local: adopting one would hand somebody
+            # the operator ejected a fresh copy of every message.
+            local = {
+                user_hash
+                for user_hash, _role in self.store.list_members(
+                    group.group_id, include_banned=True
+                )
+            }
             fresh = self.store.adopt(
                 peer_hash, group.group_id, [item for item in members if item not in local]
             )

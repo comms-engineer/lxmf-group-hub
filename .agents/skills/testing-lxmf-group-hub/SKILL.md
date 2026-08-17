@@ -16,6 +16,10 @@ pip install -e ".[dev]"      # deps: rns, lxmf, msgpack (+ pytest, ruff)
 pytest -q && ruff check .     # fast sanity gate, not proof of the feature
 ```
 
+The editable install can fail with `backend does not implement build_editable`; there is no
+`setup.py` to fall back on. Install the dependencies directly instead and run the suite from the
+repository root: `pip install rns lxmf msgpack pytest ruff`.
+
 `tools/local_testnet.py` writes `~/.lxmf_hub_testnet/<name>/reticulum/config` per role with its own
 TCP interface and `share_instance = No`, so every role is a separate Reticulum instance.
 Wipe `rm -rf ~/.lxmf_hub_testnet` between scenarios. There is no auth/secret of any kind.
@@ -97,11 +101,11 @@ Use short timeouts or an outage takes 30 minutes:
   `<storage_path>/lxmf/ratchets/<dest hash>.ratchets`. The `Directory on <hash>` log line must be
   byte-identical across restarts even with ratchets enabled.
 * **LXMF reads attributes off any delivery destination** (`stamp_cost`, ratchets) on every inbound
-  message and announce. If a hand-built `RNS.Destination` is missing them, the daemon survives but
-  logs `Hub supervision error: 'Destination' object has no attribute 'stamp_cost'` once a second
-  and **the failover check never runs in that iteration**. Always grep hub logs for
-  `supervision error|AttributeError` and treat a non-zero count as a failure even when the feature
-  under test looks fine.
+  message and announce. If a hand-built `RNS.Destination` is missing them, the daemon logs
+  `Hub supervision error during <task>: …` once a second. Each supervision task is now guarded
+  separately, so an announce failure no longer suppresses the failover check or the prune in that
+  iteration — but still grep hub logs for `supervision error|AttributeError` and treat a non-zero
+  count as a failure even when the feature under test looks fine, and check *which* task is named.
 * **Boot-into-outage**: a hub whose peer never answers must isolate one `peer_timeout_sec` after
   *its own start* (not at t=0, not never), with `peer_liveness` empty. Adoption cannot be tested
   for a never-seen peer — member sets only arrive by gossip.
@@ -147,9 +151,11 @@ with framing byte `0x01` and contain no plaintext.
   `items / rate`; a broken bucket empties the queue in under a second.
 * Members must exist **before** fan-out — `add-member` first, then send. Public groups enrol the
   sender on first message; the author is always excluded from fan-out.
-* Federation: `FederationEngine._run` sleeps `sync_interval_sec` *before* the first round (harness:
-  15 s), so wait ≥2 intervals. Both hubs must list each other via `--peer <federation endpoint
-  hash>` — `_peer_allowed` rejects unconfigured peers. `epoch_seconds` and `merkle_depth` must
+* Federation: `FederationEngine._run` sleeps `min(15 s, sync_interval_sec)` before the first round
+  and `sync_interval_sec` thereafter, so a restarted hub backfills within ~15 s; still wait
+  ≥2 intervals before calling a missing message a bug. Both hubs must list each other via
+  `--peer <federation endpoint hash>` — `_peer_allowed` rejects unconfigured peers, and a peer
+  entry that is not 16 bytes of hex now fails at startup. `epoch_seconds` and `merkle_depth` must
   match on both sides or you get `peer rejected sync parameters`.
 * Get each hub's `federation endpoint:` hash by booting it once (`timeout 12 python3
   tools/local_testnet.py hub …`), killing it, then restarting with `--peer`. Identity and DB
@@ -158,6 +164,17 @@ with framing byte `0x01` and contain no plaintext.
   `status` (`egress_queue`), `kill -9` the hub, read `status` again while it is down, restart and
   confirm `Hub running with … N queued delivery item(s)`, then bring the member back and watch the
   delivery land.
+* Good operator-answer durability test: answers live in `control_queue` (visible as `control_queue`
+  in `status`), not in an inline send. Queue one for an operator hash with no path (send a command
+  from a client whose identity the hub cannot recall, or enqueue via `Store.enqueue_control`),
+  `kill -9` the hub, confirm the depth survives, then bring the operator up and watch the answer
+  land. Answers are drained ahead of client traffic and spend no egress tokens, so a deep client
+  backlog must not delay a `status` reply.
+* A row handed to the router is held in memory until a callback resolves it, for at most
+  `egress.delivery_timeout_sec` (default 600 s). When testing retries, drive them with delivery
+  *failures* rather than by waiting out that timeout, and remember a propagated delivery's callback
+  means the propagation node accepted the message — the log says "handed to the propagation node
+  for", not "delivered to", and the client still has to sync.
 * Good backfill test: seed hub A while peer hub C is *down* (register C's member in C's DB
   meanwhile), then start C and expect `Ingested N message(s)` plus N deliveries — proves
   anti-entropy rather than live-only propagation.

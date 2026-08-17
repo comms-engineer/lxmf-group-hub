@@ -25,6 +25,12 @@ class EgressConfig:
     propagation_node: str | None = None
     stamp_cost: int | None = None
     path_request_grace_sec: float = 15.0
+    # How long a message handed to LXMF may be in flight before the scheduler
+    # assumes neither callback is coming and offers the queue row again. LXMF
+    # retries a delivery of its own accord (five attempts, ten seconds apart,
+    # plus link setup), so this has to be comfortably longer than that or the
+    # hub sends a second copy of a message that is still on its way.
+    delivery_timeout_sec: float = 600.0
 
 
 @dataclass
@@ -40,6 +46,29 @@ class FederationConfig:
     link_timeout_sec: float = 30.0
     request_timeout_sec: float = 20.0
     max_fetch_batch: int = 256
+
+    @property
+    def peer_hashes(self) -> list[bytes]:
+        """Peer destination hashes, validated as 16-byte hex strings.
+
+        Validated here rather than at each use site so a typo in one peer entry
+        is a clear configuration error at startup instead of a ValueError from
+        inside a federation or failover thread, where it would silently stop
+        that thread for the lifetime of the process.
+        """
+        hashes = []
+        for value in self.peers:
+            try:
+                peer_hash = bytes.fromhex(value.strip())
+            except ValueError as exception:
+                raise ValueError(f"federation peer '{value}' is not hex") from exception
+            if len(peer_hash) != DESTINATION_HASH_LENGTH:
+                raise ValueError(
+                    f"federation peer '{value}' is not a"
+                    f" {DESTINATION_HASH_LENGTH}-byte destination hash"
+                )
+            hashes.append(peer_hash)
+        return hashes
 
 
 @dataclass

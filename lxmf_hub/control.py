@@ -24,7 +24,7 @@ import time
 import LXMF
 import RNS
 
-from .admin import CommandError, administer, build_parser
+from .admin import CommandError, administer, build_parser, command_usage
 from .config import HubConfig
 from .store import Store
 
@@ -44,6 +44,12 @@ REMOTE_COMMANDS = frozenset(
 )
 
 HELP_TOKENS = frozenset({"help", "-h", "--help", "?"})
+
+# An operator types a command on a phone keyboard, so a stray autocapitalised
+# verb or a smart-quoted hash is a typing artefact rather than a different
+# command. The bytes an operator can send are bounded so a large message cannot
+# be turned into a large parse.
+MAX_COMMAND_BYTES = 4096
 
 
 class ControlChannel:
@@ -108,67 +114,100 @@ class ControlChannel:
         self.reply(message.source_hash, self.execute(command))
 
     def execute(self, command: str) -> str:
-        """Run one operator command line and return the text to send back."""
+        """Run one operator command line and return the text to send back.
+
+        Every path returns text. A command that cannot be parsed, is not
+        allowlisted, or raises anything at all still produces an answer, because
+        an operator with no reply cannot tell a refused command from a hub that
+        has stopped listening.
+        """
+        if len(command.encode("utf-8", "replace")) > MAX_COMMAND_BYTES:
+            return f"That command is too long (limit {MAX_COMMAND_BYTES} bytes)."
+
         try:
-            tokens = shlex.split(command)
+            tokens = shlex.split(_normalise(command))
         except ValueError as exception:
-            return f"Could not parse that command: {exception}"
+            return f"Could not parse that command: {exception}\n\n{self.help()}"
 
         if not tokens or tokens[0].lower() in HELP_TOKENS:
-            return self.help()
-        if tokens[0] not in REMOTE_COMMANDS:
+            return self.help(tokens[1] if len(tokens) > 1 else None)
+
+        verb = tokens[0].lower()
+        if verb not in REMOTE_COMMANDS:
             return f"'{tokens[0]}' is not an operator command.\n\n{self.help()}"
+        if len(tokens) > 1 and tokens[1].lower() in HELP_TOKENS:
+            return self.help(verb)
+        tokens[0] = verb
 
         try:
             args = build_parser().parse_args(tokens)
             return administer(args, self.config, self.store) or "done"
         except CommandError as exception:
-            return str(exception) or self.help()
+            return str(exception) or self.help(verb)
         except Exception as exception:
             RNS.log(f"Operator command '{command}' failed: {exception}", RNS.LOG_ERROR)
             RNS.trace_exception(exception)
             return f"Command failed: {exception}"
 
-    def help(self) -> str:
-        return "Commands: " + ", ".join(sorted(REMOTE_COMMANDS))
+    def help(self, verb: str | None = None) -> str:
+        """Usage text taken from the parser, so it cannot drift from the verbs."""
+        if verb is not None and verb.lower() in REMOTE_COMMANDS:
+            return build_parser().subcommands[verb.lower()].format_help().strip()
+
+        parser = build_parser()
+        lines = ["Commands:"]
+        for name in sorted(REMOTE_COMMANDS):
+            lines.append(f"  {command_usage(name)}")
+            lines.append(f"      {parser.summaries[name]}")
+        lines.append("Send 'help <command>' for one command in detail.")
+        lines.append("Hashes may be pasted as <a1b2..>, a1:b2:.. or plain hex.")
+        return "\n".join(lines)
 
     # -- outbound --------------------------------------------------------
 
     def reply(self, operator_hash: bytes, text: str) -> None:
-        """Answer an operator directly, outside the client egress queue.
+        """Queue an answer for an operator.
 
-        Control traffic is a couple of packets per command and only ever goes to
-        an operator, so it does not consume egress tokens meant for keeping group
-        reflections off a saturated RF interface.
+        Queued rather than handed straight to the router: the answer to a command
+        that has already changed the database is not something to drop because
+        the operator's path happens to be unknown this second, or because the
+        first delivery attempt failed. The egress scheduler drains these ahead of
+        client traffic and without spending client tokens, retrying with the same
+        backoff as everything else, so an answer survives a restart.
         """
         if self.destination is None:
             return
-        identity = RNS.Identity.recall(operator_hash)
-        if identity is None:
-            RNS.Transport.request_path(operator_hash)
-            RNS.log(
-                f"No identity for operator {RNS.prettyhexrep(operator_hash)},"
-                " dropping the reply",
-                RNS.LOG_WARNING,
-            )
-            return
+        self.store.enqueue_control(operator_hash, text)
 
+    def build_reply(self, recipient_identity: RNS.Identity, body: str) -> LXMF.LXMessage:
+        """Build one queued answer, for the egress scheduler to send."""
+        if self.destination is None:
+            raise ValueError("The control destination is not running")
         target = RNS.Destination(
-            identity, RNS.Destination.OUT, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery"
+            recipient_identity,
+            RNS.Destination.OUT,
+            RNS.Destination.SINGLE,
+            LXMF.APP_NAME,
+            "delivery",
         )
-        message = LXMF.LXMessage(
+        return LXMF.LXMessage(
             target,
             self.destination,
-            content=text.encode("utf-8"),
+            content=body.encode("utf-8"),
             title=b"",
-            desired_method=self._desired_method(),
         )
-        self.router.handle_outbound(message)
 
-    def _desired_method(self) -> int:
-        if self.config.egress.prefer_propagation and self.router.get_outbound_propagation_node():
-            return LXMF.LXMessage.PROPAGATED
-        return LXMF.LXMessage.DIRECT
+
+def _normalise(command: str) -> str:
+    """Undo what a phone keyboard does to a command line.
+
+    Smart quotes are the common one: a client that substitutes them turns a
+    quoted display name into an unparseable line, and the operator sees a parse
+    error for something they typed correctly.
+    """
+    for fancy, plain in (("\u201c", '"'), ("\u201d", '"'), ("\u2018", "'"), ("\u2019", "'")):
+        command = command.replace(fancy, plain)
+    return command.strip()
 
 
 def _text(content: bytes | str | None) -> str:
