@@ -68,6 +68,38 @@ def test_a_peer_never_reached_is_measured_from_startup(tmp_path):
     assert engine.stale_peers(now=engine.started_at + 1801) == [PEER]
 
 
+def test_a_timeout_under_two_sync_intervals_is_raised(tmp_path):
+    """Liveness only advances on a sync round, so a shorter timeout adopts a live peer."""
+    config = HubConfig()
+    config.federation.sync_interval_sec = 120.0
+    config.failover.peer_timeout_sec = 60.0
+    engine, store = build(tmp_path, config=config)
+
+    assert engine.peer_timeout == 240.0
+    answered(store, engine.started_at)
+    assert engine.stale_peers(now=engine.started_at + 200) == []
+
+
+def test_a_timeout_above_the_floor_is_left_alone(tmp_path):
+    config = HubConfig()
+    config.federation.sync_interval_sec = 120.0
+    config.failover.peer_timeout_sec = 900.0
+    engine, _store = build(tmp_path, config=config)
+
+    assert engine.peer_timeout == 900.0
+
+
+def test_a_short_timeout_stands_without_federation(tmp_path):
+    """With no sync rounds to wait for, the operator's value is the only signal."""
+    config = HubConfig()
+    config.federation.enabled = False
+    config.federation.sync_interval_sec = 120.0
+    config.failover.peer_timeout_sec = 60.0
+    engine, _store = build(tmp_path, config=config)
+
+    assert engine.peer_timeout == 60.0
+
+
 def test_a_recent_answer_keeps_a_peer_live(tmp_path):
     engine, store = build(tmp_path)
     answered(store, engine.started_at + 1000)
@@ -325,6 +357,29 @@ def test_a_banned_member_stays_banned_when_gossiped_as_a_peer_member(tmp_path):
     engine.hub.handle_inbound(inbound(source=REMOTE_MEMBER))
 
     assert store.group_history(GROUP) == []
+
+
+def test_a_banned_member_is_not_adopted_from_a_stale_peer(tmp_path):
+    """A local ban outranks a peer's member list, however the member arrives."""
+    engine, store = build(tmp_path)
+    store.add_member(GROUP, REMOTE_MEMBER, ROLE_BANNED)
+    gossip(store)
+
+    engine.check(now=engine.started_at + 1801)
+
+    assert store.list_adopted(GROUP) == []
+
+
+def test_a_banned_member_receives_no_reflections_after_an_adoption(tmp_path):
+    engine, store = build(tmp_path)
+    gossip(store, members=(REMOTE_MEMBER, SECOND_REMOTE))
+    engine.check(now=engine.started_at + 1801)
+    store.add_member(GROUP, REMOTE_MEMBER, ROLE_BANNED)
+
+    engine.hub.handle_inbound(inbound(source=LOCAL_MEMBER))
+
+    recipients = {item.recipient_hash for item in store.due_egress(10)}
+    assert recipients == {SECOND_REMOTE}
 
 
 def test_removing_a_member_on_the_peer_withdraws_it_here(tmp_path):

@@ -29,6 +29,7 @@ REQUESTER = b"\xa1" * 16
 class StubRouter:
     def __init__(self):
         self.sent = []
+        self.pending_outbound = []
         self.announced = []
 
     def get_outbound_propagation_node(self):
@@ -265,6 +266,7 @@ class FakeMessage:
         self.source = source
         self.content = content
         self.desired_method = desired_method
+        self.method = LXMF.LXMessage.DIRECT
         self.delivered = None
 
     def register_delivery_callback(self, callback):

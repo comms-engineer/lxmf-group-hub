@@ -15,7 +15,7 @@ import time
 import LXMF
 import RNS
 
-from .config import HubConfig
+from .config import DESTINATION_HASH_LENGTH, HubConfig
 from .crypto import MODE_NONE
 from .destinations import group_destination_hash
 from .failover import format_age
@@ -44,6 +44,10 @@ class TextParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._collected: list[str] = []
+        # Subparsers by verb, so the control channel can quote real usage text
+        # instead of a hand-maintained list that drifts from the arguments.
+        self.subcommands: dict[str, TextParser] = {}
+        self.summaries: dict[str, str] = {}
 
     def _print_message(self, message, file=None) -> None:
         if message:
@@ -79,35 +83,57 @@ def build_parser() -> TextParser:
     parser.add_argument("--config", help="path to a hub configuration JSON file")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("run", help="run the hub daemon")
+    def add_command(verb: str, summary: str) -> TextParser:
+        sub = subparsers.add_parser(verb, help=summary)
+        parser.subcommands[verb] = sub
+        parser.summaries[verb] = summary
+        return sub
 
-    create = subparsers.add_parser("create-group", help="create a group and its RNS identity")
+    add_command("run", "run the hub daemon")
+
+    create = add_command("create-group", "create a group and its RNS identity")
     create.add_argument("group_id")
     create.add_argument("--name", help="display name announced to clients")
     create.add_argument("--acl", choices=[ACL_PUBLIC, ACL_INVITE], help="ACL mode")
 
-    subparsers.add_parser("groups", help="list groups and their destination hashes")
+    add_command("groups", "list groups and their destination hashes")
 
-    acl = subparsers.add_parser("set-acl", help="change the ACL mode of a group")
+    acl = add_command("set-acl", "change the ACL mode of a group")
     acl.add_argument("group_id")
     acl.add_argument("acl", choices=[ACL_PUBLIC, ACL_INVITE])
 
-    add = subparsers.add_parser("add-member", help="authorise an LXMF destination hash")
+    add = add_command("add-member", "authorise an LXMF destination hash")
     add.add_argument("group_id")
     add.add_argument("user_hash")
     add.add_argument("--role", choices=[ROLE_MEMBER, ROLE_ADMIN, ROLE_BANNED], default=ROLE_MEMBER)
 
-    remove = subparsers.add_parser("remove-member", help="remove a member from a group")
+    remove = add_command("remove-member", "remove a member from a group")
     remove.add_argument("group_id")
     remove.add_argument("user_hash")
 
-    members = subparsers.add_parser("members", help="list the members of a group")
+    members = add_command("members", "list the members of a group")
     members.add_argument("group_id")
 
-    subparsers.add_parser("status", help="show queue depth and group counts")
+    add_command("status", "show queue depths and group counts")
 
-    subparsers.add_parser("peers", help="show peer hubs, their endpoints and last contact")
+    add_command("peers", "show peer hubs, their endpoints and last contact")
     return parser
+
+
+def command_usage(verb: str) -> str:
+    """One-line usage for a verb, as argparse itself would print it.
+
+    ``-h`` is dropped: it is real for a shell, but an operator sending a message
+    asks for help with ``help <command>`` and listing a flag they cannot usefully
+    send only makes the line harder to read on a phone.
+    """
+    parser = build_parser()
+    sub = parser.subcommands.get(verb)
+    if sub is None:
+        return verb
+    tokens = [token for token in sub.format_usage().split() if token != "[-h]"]
+    usage = " ".join(tokens).removeprefix(f"usage: {parser.prog} ")
+    return usage.strip() or verb
 
 
 def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str:
@@ -142,25 +168,39 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
     if args.command == "add-member":
         if store.get_group(args.group_id) is None:
             raise CommandError(f"No such group: {args.group_id}")
-        store.add_member(args.group_id, user_hash(args.user_hash), args.role)
-        return f"{args.user_hash} is {args.role} in {args.group_id}"
+        member = user_hash(args.user_hash)
+        store.add_member(args.group_id, member, args.role)
+        return f"{member.hex()} is {args.role} in {args.group_id}"
 
     if args.command == "remove-member":
-        store.remove_member(args.group_id, user_hash(args.user_hash))
-        return f"{args.user_hash} removed from {args.group_id}"
+        # Checked rather than fired and forgotten: an operator who mistypes a
+        # group or a hash otherwise gets the same confirmation as a real removal
+        # and believes somebody has been ejected who has not.
+        if store.get_group(args.group_id) is None:
+            raise CommandError(f"No such group: {args.group_id}")
+        member = user_hash(args.user_hash)
+        if store.get_role(args.group_id, member) is None:
+            return f"{member.hex()} was not a member of {args.group_id}"
+        store.remove_member(args.group_id, member)
+        return f"{member.hex()} removed from {args.group_id}"
 
     if args.command == "members":
+        if store.get_group(args.group_id) is None:
+            raise CommandError(f"No such group: {args.group_id}")
         lines = [
             f"{member.hex()}\t{role}"
             for member, role in store.list_members(args.group_id, include_banned=True)
         ]
+        # Adopted members receive here too, so an operator asking who is served
+        # by this hub has to see them.
+        lines.extend(f"{member.hex()}\tadopted" for member in store.list_adopted(args.group_id))
         return "\n".join(lines) or "no members"
 
     if args.command == "peers":
         now = time.time()
         lines = []
-        for peer in config.federation.peers:
-            peer_hash = bytes.fromhex(peer)
+        for peer_hash in config.federation.peer_hashes:
+            peer = peer_hash.hex()
             last = store.peer_last_success(peer_hash)
             seen = f"{format_age(now - last)} ago" if last else "never"
             adopted = sum(
@@ -180,6 +220,7 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
             f"groups\t{len(store.list_groups())}",
             f"egress_queue\t{store.egress_depth()}",
             f"notice_queue\t{store.notice_depth()}",
+            f"control_queue\t{store.control_depth()}",
         ]
         control = control_destination_hash(config) if config.operator_hashes else None
         if control is not None:
@@ -190,7 +231,23 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
 
 
 def user_hash(value: str) -> bytes:
+    """Parse a destination hash the way an operator is likely to have copied it.
+
+    RNS prints hashes as ``<a1b2...>`` and clients show them grouped with colons,
+    so those forms are accepted rather than rejected as "not hex". The length is
+    checked too: ``bytes.fromhex`` is happy with a truncated hash, which would
+    otherwise be stored as a member nothing can ever match.
+    """
+    cleaned = value.strip().strip("<>").replace(":", "").replace("-", "").replace(" ", "")
+    if cleaned[:2].lower() == "0x":
+        cleaned = cleaned[2:]
     try:
-        return bytes.fromhex(value)
+        parsed = bytes.fromhex(cleaned)
     except ValueError as exception:
         raise CommandError(f"'{value}' is not a hex destination hash") from exception
+    if len(parsed) != DESTINATION_HASH_LENGTH:
+        raise CommandError(
+            f"'{value}' is {len(parsed)} byte(s); an LXMF destination hash is"
+            f" {DESTINATION_HASH_LENGTH} ({DESTINATION_HASH_LENGTH * 2} hex characters)"
+        )
+    return parsed
