@@ -36,7 +36,9 @@ lxmf-hub --config hub.json run
 
 Administration is out of band by design, because in-band commands would mean parsing text from unauthenticated senders. Groups, ACLs, and roles live in SQLite; `create-group`, `add-member`, `remove-member`, `set-acl`, `groups`, `members`, and `status` all operate on the database directly and are safe to run while the daemon is up. A running daemon rescans the `groups` table every 30 seconds and attaches anything new, so a group created at 14:02 is announcing by 14:03 without a restart.
 
-`status` prints the group count, the egress queue depth, and, when `operator_identity` is set, the control destination hash operators address.
+`status` prints the group count, the egress, notice, and operator answer queue depths, and, when `operator_identity` is set, the control destination hash operators address.
+
+Destination hashes are accepted in the shapes clients and RNS actually print them: `<8f1c0d7a...>`, `8f:1c:0d:7a:...`, `0x8f1c...`, or plain hex. A hash of the wrong length is refused rather than stored, since `bytes.fromhex` accepts a truncated paste happily and a member nothing can ever match looks exactly like a member who is offline.
 
 Two ACL modes exist. In an `invite` group, a message from a hash that isn't in `members` is logged and dropped. In a `public` group, the first signed message from an unknown hash enrolls that sender as `member`. Roles are `member`, `admin`, and `banned`; a `banned` hash can't post and is skipped during fan-out, so banning takes effect on the next message rather than at the next restart.
 
@@ -67,7 +69,8 @@ Every key is optional. The values below are the built-in defaults.
     "prefer_propagation": true,
     "propagation_node": null,
     "stamp_cost": null,
-    "path_request_grace_sec": 15
+    "path_request_grace_sec": 15,
+    "delivery_timeout_sec": 600
   },
   "federation": {
     "enabled": true,
@@ -110,14 +113,16 @@ Commands are the CLI verbs, sent as ordinary message text from an allowed hash:
 groups                          ->  ops   invite   3 member(s)   b196e0eb...
 create-group nets --acl public  ->  nets  public   7d41c9a2...
 add-member ops 8f1c0d7a...      ->  8f1c0d7a... is member in ops
-status                          ->  groups 2, egress_queue 0, notice_queue 0, control 707a7f49...
+status                          ->  groups 2, egress_queue 0, notice_queue 0, control_queue 0, control 707a7f49...
 peers                           ->  9d2f0c81... last answered 4m ago   3 member(s) known
                                       ops   Standby Hub   7d41c9a2...
 ```
 
 `create-group`, `groups`, `set-acl`, `add-member`, `remove-member`, `members`, `status`, and `peers` are reachable. `run` is not, and anything outside that set comes back as a list of what is. Argument errors, unknown groups, and malformed hashes are answered as text instead of raising, because there's no terminal on the other end to read a traceback. Commands write to SQLite and the daemon hot-loads them, so a group created from a phone is announcing within 30 seconds.
 
-A message on the control destination from a hash that isn't an operator, or one whose signature didn't validate, is logged at notice level and dropped with no reply. Replies go out directly rather than through the client egress queue, since two packets to one operator shouldn't spend tokens meant for keeping group reflections off a saturated RF interface.
+The command line is read the way a phone produces it: the verb is case-insensitive, smart quotes are folded back to plain ones before parsing, and a line over 4096 bytes is refused. `help` lists every reachable verb with the usage argparse itself prints, and `help <command>` or `<command> --help` gives one command in full, so the help can't drift from the arguments the parser accepts.
+
+A message on the control destination from a hash that isn't an operator, or one whose signature didn't validate, is logged at notice level and dropped with no reply. Answers are queued in `control_queue` and drained by the egress scheduler ahead of client traffic, without spending client tokens: an answer to a command that has already changed the database is worth the same retries, path requests, and restart survival as a reflection, and dropping it because the operator's path happened to be unknown that second is what makes the control channel look dead while it is working. Two identical answers are two rows, unlike notices, because two `status` commands deserve two replies.
 
 The control hash comes from `lxmf-hub status` or the startup log line `Operator control on <707a7f49...>`.
 
@@ -157,9 +162,13 @@ Where a delivery goes depends on `prefer_propagation`. With a `propagation_node`
 
 Three failure paths get separate handling:
 
-* No known identity for the recipient. The hub calls `RNS.Transport.request_path` once and defers the item by `path_request_grace_sec`, 15 seconds, without counting an attempt. An unreachable member can't burn through `max_attempts` while their radio is off.
+* No known identity for the recipient. The hub calls `RNS.Transport.request_path` and defers the item without counting an attempt, so an unreachable member can't burn through `max_attempts` while their radio is off. Those uncounted deferrals are counted separately as graces, and the wait doubles with each one from `path_request_grace_sec` up to the retry ceiling: a member who is off for a week is asked for with a growing backoff rather than every 15 seconds for a week.
 * Delivery failure. The item is deferred by `retry_backoff_sec * 2**attempts`, so retries land at 60s, 120s, 240s, and so on to the 3600 second ceiling, and are abandoned after 10 attempts.
 * Daemon death mid-transfer. The item is re-armed in SQLite *before* `handle_outbound` is called, and only the LXMF delivery callback removes it. A `kill -9` between those two points leaves the row queued, and the next start picks it up. Verified on the testnet: queue depth 1, `kill -9`, depth still 1 while down, `Hub running with 1 group(s) and 1 queued delivery item(s)` on restart, delivery completed, depth 0.
+
+Re-arming before handoff is what makes a `kill -9` safe, and on its own it makes a slow delivery unsafe: LXMF retries a direct delivery five times ten seconds apart on top of link setup, which can outlast the backoff, and the scheduler would then send a second copy of a message still on its way. Rows handed to the router are therefore held in memory until a callback resolves them, for at most `delivery_timeout_sec`; past that they are offered again only once LXMF no longer holds the message, and a `handle_outbound` that raises releases the row immediately rather than waiting out the timeout for callbacks that will never fire. A token spent on a row that turns out to be undeliverable -- pruned message, detached group, attempts exhausted -- is refunded, so a batch of dead rows can't stall the messages behind them.
+
+One delivery milestone is worth reading carefully in the logs. For a direct delivery, LXMF's callback means the recipient has the message. For a propagated one, it means the propagation node accepted it and the client will collect it when it next syncs, which is why those two cases are logged differently: a hub that reports "delivered" for messages sitting on a propagation node is the reason "it says delivered" and "I never got it" can both be true.
 
 ## Federation by Merkle anti-entropy
 
@@ -167,7 +176,7 @@ Peer hubs are assumed to sit on TCP, I2P, or WireGuard interfaces at 1Mbps or be
 
 Every message hash falls into an epoch, `int(timestamp / 3600)` by default, and each epoch gets a Merkle tree. Leaves are buckets of the hash space rather than positions in a sorted list: at `merkle_depth` 8 there are 256 leaves, and bucket `i` holds every hash whose first 8 bits equal `i`. Sorted-list indices would have been cheaper to compute and useless, because leaf 12 on a hub holding 40 messages and leaf 12 on a hub holding 4,000 would cover different messages. Prefix buckets mean index 12 covers the same slice of hash space on every hub in the mesh.
 
-A sync round every `sync_interval_sec` opens an RNS Link, identifies with the hub identity, and runs four requests:
+A sync round every `sync_interval_sec` opens an RNS Link, identifies with the hub identity, and runs four requests. The first round runs 15 seconds after startup rather than a full interval in, since a hub that just restarted is exactly the one that doesn't know what it missed. A group whose reconciliation raises is recorded as a sync error by name and skipped for that round only; the groups after it in the same round still reconcile, because a single wedged group stopping all federation is how a backlog becomes permanent.
 
 | Path | Request | Response |
 | --- | --- | --- |
@@ -177,6 +186,8 @@ A sync round every `sync_interval_sec` opens an RNS Link, identifies with the hu
 | `/fed/fetch` | group, message hashes | count, then an RNS Resource carrying the batch |
 
 Only epochs whose roots differ are walked, and the walk descends 8 levels asking for the children of nodes that disagree. Missing hashes are fetched in batches of 256 as `RNS.Resource` payloads, never as individual LXMF packets, then ingested with the same `INSERT OR IGNORE` path local messages use and fanned out to local members.
+
+Peer entries are validated as 16-byte hex hashes where they're read, so a typo is a startup error rather than a `ValueError` raised inside a federation or failover thread, which would stop that thread for the life of the process.
 
 Peering is mutual and explicit. A request from an identity whose federation destination hash isn't in `federation.peers` is refused, and `epoch_seconds` and `merkle_depth` have to match on both sides or the peer returns a null root set and logs that the parameters were rejected. Hubs don't need to share an at-rest encryption key, since hashes are computed over plaintext.
 
@@ -206,7 +217,7 @@ This protects a stolen disk, a copied backup, or a decommissioned SD card. It do
 
 A group's destination hash comes from that hub's own identity, so the same group on two federated hubs has two addresses, and nothing in RNS or LXMF can tell an unmodified client to switch. What's built is the honest version of failover: the surviving hub keeps delivering, and tells the human where to post.
 
-Each sync round now also exchanges `/fed/state`, where a hub reports its name, the groups it hosts, their destination hashes, and their member hashes. Liveness is the last round a peer actually answered, not the last one this hub tried, since a hub records every attempt including the failures. A peer silent for `peer_timeout_sec`, 1800 seconds or six sync intervals, is treated as down from this hub's point of view. That's local evidence, not a claim about the rest of the network.
+Each sync round now also exchanges `/fed/state`, where a hub reports its name, the groups it hosts, their destination hashes, and their member hashes. Liveness is the last round a peer actually answered, not the last one this hub tried, since a hub records every attempt including the failures. A peer silent for `peer_timeout_sec`, 1800 seconds or six sync intervals, is treated as down from this hub's point of view. That's local evidence, not a claim about the rest of the network. Because only a sync round can refresh liveness, a `peer_timeout_sec` below two `federation.sync_interval_sec` would declare a healthy peer stale between rounds and notify every client, so it is raised to that floor with a warning naming both settings.
 
 Three things then happen, all of them queued in SQLite and paced by the same token bucket as reflections, so adopting 40 members doesn't dump 40 messages onto an RF interface:
 
@@ -248,14 +259,16 @@ Adoption also can't help a group only one hub hosts. A hub serves a silent peer'
 
 SQLite runs with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=30000`. Every state transition is committed before it's acted on, which is what makes the egress guarantee above hold: the queue row exists on disk before the message is handed to the router, and the peer sync timestamp is written after the ingest that earned it.
 
+Storing a message and fanning it out are one transaction, because the store is also what dedup and federation read: a crash between the two would leave a message that every hub agrees exists, that nobody is queued to receive, and that the sender's retry can no longer replace, since the retry arrives as a duplicate. Either the message is unknown and the client's retry works, or it is known and queued for everyone. Pruning removes the queue rows of messages it deletes in the same transaction, for the same reason in the other direction.
+
 ## Tests
 
 ```bash
-pytest -q      # 134 tests
+pytest -q      # 175 tests
 ruff check .
 ```
 
-The suite covers WAL mode, dedup, hub-independent hashing, ACL enforcement for all three roles, author-field stripping, token bucket pacing, backoff growth and its ceiling, attempt capping, propagation versus direct method selection, wrong-key detection, exact Merkle traversal against a known missing set, multi-epoch backfill, peer rejection on mismatched parameters, and the control path including refusal of non-operators, unsigned messages, and verbs outside the remote allowlist.
+The suite covers atomic store-and-fan-out including rollback, in-flight suppression of a duplicate send and its recovery once LXMF drops the message, grace counting separate from delivery attempts, the durable operator answer queue, opening a database written before the `graces` column existed, WAL mode, dedup, hub-independent hashing, ACL enforcement for all three roles, author-field stripping, token bucket pacing, backoff growth and its ceiling, attempt capping, propagation versus direct method selection, wrong-key detection, exact Merkle traversal against a known missing set, multi-epoch backfill, peer rejection on mismatched parameters, and the control path including refusal of non-operators, unsigned messages, and verbs outside the remote allowlist.
 
 Failover and the directory add: liveness measured from answers rather than attempts, adoption restricted to locally hosted groups and idempotent across checks, peer members admitted to an invite-only group while banned hashes stay out, member sets withdrawn when a peer drops them, hand-back and both isolation transitions firing once each, notices surviving a reopen of the database, and directory listings, per-requester rate limiting, and unsigned queries.
 
@@ -270,7 +283,6 @@ python tools/local_testnet.py client --name alice --connect 4242 --send-to <grou
 Hub b joins the federation with `--port 4243 --connect 4242 --peer <hub_a_federation_hash>`, where that hash is printed at hub a's startup. Set `TESTNET_LOGLEVEL=7` for per-message hub and federation output.
 
 ## To-Do
-- More robust operator commands, including help
 - Per-user username setting, for message prefixes
 
 ## Licence

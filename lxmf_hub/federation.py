@@ -50,6 +50,12 @@ PROTOCOL_VERSION = 1
 
 RESOURCE_MESSAGES = 1
 
+# A hub that just started has no idea what it missed while it was down, and
+# waiting a full sync interval to find out means the gap is invisible for five
+# minutes on the default settings. Long enough for interfaces and paths to come
+# up, short enough that a restart is not a five-minute hole.
+INITIAL_SYNC_DELAY = 15.0
+
 MAX_EPOCHS_PER_RESPONSE = 512
 MAX_NODES_PER_REQUEST = 1024
 MAX_BUCKETS_PER_REQUEST = 64
@@ -74,7 +80,7 @@ class FederationEngine:
         self._inbound_links: dict[bytes, RNS.Link] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._peers: list[bytes] = [bytes.fromhex(peer) for peer in config.federation.peers]
+        self._peers: list[bytes] = config.federation.peer_hashes
         self._allowed: set[bytes] = set(self._peers)
 
     # -- lifecycle -------------------------------------------------------
@@ -114,8 +120,10 @@ class FederationEngine:
             self.destination.announce()
 
     def _run(self) -> None:
+        delay = min(INITIAL_SYNC_DELAY, self.config.federation.sync_interval_sec)
         while not self._stop.is_set():
-            self._stop.wait(self.config.federation.sync_interval_sec)
+            self._stop.wait(delay)
+            delay = self.config.federation.sync_interval_sec
             if self._stop.is_set():
                 return
             for peer_hash in self._peers:
@@ -278,13 +286,30 @@ class FederationEngine:
                 return 0
 
             ingested = 0
+            failed: list[str] = []
             local_groups = set(self._local_group_ids())
             for group_id, remote_roots in response[1].items():
                 if group_id not in local_groups:
                     continue
-                ingested += self._reconcile_group(link, state, group_id, remote_roots)
+                try:
+                    ingested += self._reconcile_group(link, state, group_id, remote_roots)
+                except Exception as exception:
+                    # One group's reconciliation failing is not a reason to skip
+                    # the groups after it in the same round: they are independent,
+                    # and the alternative is that a single wedged group stops this
+                    # hub federating anything at all.
+                    failed.append(group_id)
+                    RNS.log(
+                        f"Reconciling group '{group_id}' with"
+                        f" {RNS.prettyhexrep(peer_hash)} failed: {exception}",
+                        RNS.LOG_WARNING,
+                    )
 
-            self.store.record_peer_sync(peer_hash, None)
+            self.store.record_peer_sync(
+                peer_hash,
+                f"could not reconcile: {', '.join(sorted(failed))}" if failed else None,
+            )
+            # The peer answered, whatever happened per group, so it is live.
             self.store.record_peer_success(peer_hash)
             if ingested:
                 RNS.log(

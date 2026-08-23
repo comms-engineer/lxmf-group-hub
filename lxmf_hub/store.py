@@ -57,12 +57,18 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_group_ts ON messages (group_id, timestamp);
 
+-- ``graces`` counts deferrals spent waiting for a path to the recipient. They
+-- are deliberately not delivery attempts, so a member whose radio is off does
+-- not burn through max_attempts without a single transmission, but they do pace
+-- the path requests: a recipient that never appears is asked for with a growing
+-- backoff instead of once per tick until the message ages out.
 CREATE TABLE IF NOT EXISTS egress_queue (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id        TEXT NOT NULL,
     recipient_hash  BLOB NOT NULL,
     msg_hash        BLOB NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
+    graces          INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL,
     created_at      REAL NOT NULL,
     UNIQUE (recipient_hash, msg_hash)
@@ -126,12 +132,31 @@ CREATE TABLE IF NOT EXISTS notice_queue (
     recipient_hash  BLOB NOT NULL,
     body            TEXT NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
+    graces          INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL,
     created_at      REAL NOT NULL,
     UNIQUE (recipient_hash, body)
 );
 
 CREATE INDEX IF NOT EXISTS idx_notice_due ON notice_queue (next_attempt_at);
+
+-- Answers to operator commands. Kept apart from notice_queue because control
+-- traffic has the opposite requirements: it must not be deduplicated (two
+-- status commands deserve two answers even when the text is identical) and it
+-- is not paced by the client token bucket, since it only ever goes to an
+-- operator. It is queued rather than handed straight to the router so an answer
+-- survives an unknown path, a failed delivery and a restart.
+CREATE TABLE IF NOT EXISTS control_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_hash  BLOB NOT NULL,
+    body            TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    graces          INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL,
+    created_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_control_due ON control_queue (next_attempt_at);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -171,10 +196,15 @@ class EgressItem:
     recipient_hash: bytes
     msg_hash: bytes
     attempts: int
+    graces: int = 0
 
 
 SOURCE_GROUP = "group"
 SOURCE_DIRECTORY = "directory"
+
+# Tables the shared deferral helper may write to. Named here so the table cannot
+# reach the statement from anywhere but this module.
+QUEUE_TABLES = frozenset({"egress_queue", "notice_queue", "control_queue"})
 
 
 @dataclass(frozen=True)
@@ -185,6 +215,16 @@ class NoticeItem:
     recipient_hash: bytes
     body: str
     attempts: int
+    graces: int = 0
+
+
+@dataclass(frozen=True)
+class ControlItem:
+    item_id: int
+    recipient_hash: bytes
+    body: str
+    attempts: int
+    graces: int = 0
 
 
 @dataclass(frozen=True)
@@ -233,7 +273,21 @@ class Store:
         self._db.execute("PRAGMA busy_timeout=30000")
         with self._lock:
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self) -> None:
+        """Add columns that a database written by an older version lacks."""
+        for table, column, definition in (
+            ("egress_queue", "graces", "INTEGER NOT NULL DEFAULT 0"),
+            ("notice_queue", "graces", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            present = {
+                row["name"]
+                for row in self._db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in present:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         with self._lock:
@@ -411,6 +465,61 @@ class Store:
             self._db.commit()
         return cursor.rowcount > 0
 
+    def store_and_enqueue(
+        self, record: MessageRecord, recipients: Sequence[bytes]
+    ) -> tuple[bool, int]:
+        """Persist a message and queue it for its recipients in one transaction.
+
+        Storing and fanning out separately loses messages: the store call is what
+        makes a message known, so a crash -- or an exception raised while
+        building the recipient set -- between the two leaves a message that is
+        recorded, deduplicated against on the next delivery and federated to
+        peers, but never queued for anybody. Doing both under one commit means a
+        message is either unknown and retriable, or known and queued.
+
+        Returns (stored, queued): stored is False if the message was already
+        known, in which case nothing is queued.
+        """
+        now = time.time()
+        with self._lock:
+            try:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO messages"
+                    " (msg_hash, group_id, sender_hash, timestamp, lxmf_payload_blob, origin,"
+                    " received_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record.msg_hash,
+                        record.group_id,
+                        record.sender_hash,
+                        record.timestamp,
+                        self._encode(record.payload),
+                        record.origin,
+                        now,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    self._db.commit()
+                    return False, 0
+                queued = 0
+                for recipient in recipients:
+                    inserted = self._db.execute(
+                        "INSERT OR IGNORE INTO egress_queue"
+                        " (group_id, recipient_hash, msg_hash, attempts, next_attempt_at,"
+                        " created_at)"
+                        " VALUES (?, ?, ?, 0, ?, ?)",
+                        (record.group_id, recipient, record.msg_hash, now, now),
+                    )
+                    queued += inserted.rowcount
+                self._db.commit()
+            except Exception:
+                # Rolled back so the message stays unknown: the sender's client
+                # will retry it, and a retry can only work if this hub has not
+                # already recorded the message and started deduplicating it.
+                self._db.rollback()
+                raise
+        return True, queued
+
     def get_message(self, msg_hash: bytes) -> MessageRecord | None:
         with self._lock:
             row = self._db.execute(
@@ -489,6 +598,7 @@ class Store:
                 recipient_hash=row["recipient_hash"],
                 msg_hash=row["msg_hash"],
                 attempts=row["attempts"],
+                graces=row["graces"],
             )
             for row in rows
         ]
@@ -504,12 +614,14 @@ class Store:
             self._db.commit()
 
     def defer_egress(self, item_id: int, delay: float, count_attempt: bool = True) -> None:
-        with self._lock:
-            self._db.execute(
-                "UPDATE egress_queue SET attempts = attempts + ?, next_attempt_at = ? WHERE id = ?",
-                (1 if count_attempt else 0, time.time() + delay, item_id),
-            )
-            self._db.commit()
+        """Re-arm a queue row.
+
+        A counted deferral is a real delivery attempt and resets the grace
+        counter, since the recipient's path was known this time round. An
+        uncounted one is a grace: it advances ``graces`` so the wait before the
+        next path request can grow.
+        """
+        self._defer("egress_queue", item_id, delay, count_attempt)
 
     # -- peers -----------------------------------------------------------
 
@@ -708,6 +820,7 @@ class Store:
                 recipient_hash=row["recipient_hash"],
                 body=row["body"],
                 attempts=row["attempts"],
+                graces=row["graces"],
             )
             for row in rows
         ]
@@ -723,11 +836,69 @@ class Store:
             self._db.commit()
 
     def defer_notice(self, item_id: int, delay: float, count_attempt: bool = True) -> None:
+        self._defer("notice_queue", item_id, delay, count_attempt)
+
+    # -- control queue ---------------------------------------------------
+
+    def enqueue_control(self, recipient_hash: bytes, body: str) -> int:
+        """Queue an answer to an operator command. Never deduplicated."""
+        now = time.time()
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO control_queue"
+                " (recipient_hash, body, attempts, next_attempt_at, created_at)"
+                " VALUES (?, ?, 0, ?, ?)",
+                (recipient_hash, body, now, now),
+            )
+            self._db.commit()
+        return int(cursor.lastrowid or 0)
+
+    def due_control(self, limit: int, now: float | None = None) -> list[ControlItem]:
+        now = time.time() if now is None else now
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM control_queue WHERE next_attempt_at <= ?"
+                " ORDER BY next_attempt_at, id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+        return [
+            ControlItem(
+                item_id=row["id"],
+                recipient_hash=row["recipient_hash"],
+                body=row["body"],
+                attempts=row["attempts"],
+                graces=row["graces"],
+            )
+            for row in rows
+        ]
+
+    def control_depth(self) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT COUNT(*) AS depth FROM control_queue").fetchone()
+        return int(row["depth"])
+
+    def complete_control(self, item_id: int) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM control_queue WHERE id = ?", (item_id,))
+            self._db.commit()
+
+    def defer_control(self, item_id: int, delay: float, count_attempt: bool = True) -> None:
+        self._defer("control_queue", item_id, delay, count_attempt)
+
+    # -- shared queue helpers --------------------------------------------
+
+    def _defer(self, table: str, item_id: int, delay: float, count_attempt: bool) -> None:
+        if table not in QUEUE_TABLES:
+            raise ValueError(f"'{table}' is not a queue table")
+        if count_attempt:
+            # A transmission happened, so the path was known: forget the graces.
+            assignment = "attempts = attempts + 1, graces = 0"
+        else:
+            assignment = "graces = graces + 1"
         with self._lock:
             self._db.execute(
-                "UPDATE notice_queue SET attempts = attempts + ?, next_attempt_at = ?"
-                " WHERE id = ?",
-                (1 if count_attempt else 0, time.time() + delay, item_id),
+                f"UPDATE {table} SET {assignment}, next_attempt_at = ? WHERE id = ?",
+                (time.time() + delay, item_id),
             )
             self._db.commit()
 
@@ -761,8 +932,18 @@ class Store:
     # -- retention -------------------------------------------------------
 
     def prune_messages(self, older_than: float) -> int:
+        """Drop aged-out messages and any queue rows that referenced them.
+
+        The egress rows have to go in the same transaction: a row whose message
+        is gone can never be delivered, and leaving it behind means the scheduler
+        keeps picking it up, spending a slot in every batch until it notices the
+        message is missing.
+        """
         with self._lock:
             cursor = self._db.execute("DELETE FROM messages WHERE timestamp < ?", (older_than,))
+            self._db.execute(
+                "DELETE FROM egress_queue WHERE msg_hash NOT IN (SELECT msg_hash FROM messages)"
+            )
             self._db.commit()
         return cursor.rowcount
 

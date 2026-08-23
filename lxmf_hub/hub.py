@@ -118,16 +118,16 @@ class GroupHub:
             payload=payload,
             origin=ORIGIN_LOCAL,
         )
-        if not self.store.store_message(record):
+        stored, queued = self.store_and_fan_out(record)
+        if not stored:
             RNS.log(f"Dropping duplicate LXM for group '{group_id}'", RNS.LOG_DEBUG)
             return
 
         RNS.log(
             f"Accepted message for group '{group_id}' from "
-            f"{RNS.prettyhexrep(message.source_hash)}",
+            f"{RNS.prettyhexrep(message.source_hash)}, queued for {queued} recipients",
             RNS.LOG_INFO,
         )
-        self.fan_out(record)
 
     def authorise(self, group: GroupRecord, sender_hash: bytes) -> bool:
         role = self.store.get_role(group.group_id, sender_hash)
@@ -183,10 +183,10 @@ class GroupHub:
                 payload=payload,
                 origin=ORIGIN_FEDERATED,
             )
-            if not self.store.store_message(record):
+            stored, _queued = self.store_and_fan_out(record)
+            if not stored:
                 continue
             ingested += 1
-            self.fan_out(record)
         return ingested
 
     # -- fan out ---------------------------------------------------------
@@ -198,15 +198,37 @@ class GroupHub:
         their own hub, and delivering to them as well would put two copies of
         every message on their RF link. Adopted members are the exception: their
         hub stopped answering, so this one delivers in its place.
+
+        A ban always wins. An adoption row can outlive the ban that followed it --
+        the member was adopted while their hub was down, then banned here -- and a
+        banned member who still receives every message is not banned.
         """
-        local = [user_hash for user_hash, _role in self.store.list_members(group_id)]
-        known = set(local)
+        members = self.store.list_members(group_id, include_banned=True)
+        local = [user_hash for user_hash, role in members if role != ROLE_BANNED]
+        banned = {user_hash for user_hash, role in members if role == ROLE_BANNED}
+        known = set(local) | banned
         return local + [
             user_hash for user_hash in self.store.list_adopted(group_id) if user_hash not in known
         ]
 
+    def store_and_fan_out(self, record: MessageRecord) -> tuple[bool, int]:
+        """Persist a message and queue it for everyone but its author, atomically.
+
+        Storing first and fanning out afterwards is what makes a message vanish:
+        the store is also the deduplication and federation source, so a crash
+        between the two leaves a message that every hub agrees exists and nobody
+        ever delivers -- and the retry, arriving at a hub that now knows the
+        message, is dropped as a duplicate.
+        """
+        recipients = [
+            user_hash
+            for user_hash in self.recipients(record.group_id)
+            if user_hash != record.sender_hash
+        ]
+        return self.store.store_and_enqueue(record, recipients)
+
     def fan_out(self, record: MessageRecord) -> int:
-        """Queue a stored message for every recipient except its author."""
+        """Queue an already stored message for every recipient except its author."""
         queued = 0
         for user_hash in self.recipients(record.group_id):
             if user_hash == record.sender_hash:
@@ -289,4 +311,5 @@ class GroupHub:
             f"groups={len(self.destinations.attached_groups())}",
             f"egress_queue={self.store.egress_depth()}",
             f"notice_queue={self.store.notice_depth()}",
+            f"control_queue={self.store.control_depth()}",
         ]
