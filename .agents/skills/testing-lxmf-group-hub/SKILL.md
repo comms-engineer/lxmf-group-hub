@@ -62,6 +62,26 @@ Wipe `rm -rf ~/.lxmf_hub_testnet` between scenarios. There is no auth/secret of 
    hub delivery callback is never invoked twice. Assert the observable instead (stored once, not
    re-reflected), and exercise store dedup through repeated federation sync rounds.
 
+7. **`sqlite3` the CLI binary may not be installed** even though the Python `sqlite3` module is.
+   Read queue depths with a one-liner instead:
+   `python3 -c "import sqlite3;print(sqlite3.connect('<db>').execute('select count(*) from control_queue').fetchone())"`.
+   Schema names to expect: `messages.msg_hash` (not `message_id`), `peer_members(peer_hash,
+   group_id, user_hash, updated_at)`, `adoptions(peer_hash, group_id, user_hash, adopted_at)` —
+   `pragma table_info(<table>)` first rather than guessing column names.
+8. **A harness client that reads its outbox by byte offset breaks if you overwrite the file.**
+   Append commands (`>> outbox`), never `> outbox`: with a monotonic read offset a truncating write
+   makes the client seek into the middle of the new line and log `bad destination …`.
+9. **Testing invalid-config startup failures needs its own `reticulum_config_path`.** Reusing a
+   running hub's Reticulum dir makes the throwaway run die with `OSError: [Errno 98] Address
+   already in use` from the TCPServer interface, which masks the config `ValueError` you are
+   asserting. Point the bad-config runs at a client-only Reticulum config (single TCPClient) and
+   assert both a non-zero exit and zero `Hub running with` lines in the captured output.
+10. **`/tmp` does not survive a box restart, but `~/.lxmf_hub_testnet` does.** Keep hub JSON
+   configs and the client harness under `~` (or re-generate them), because the RNS identities,
+   group keys and hub DBs persist — all destination hashes (group, control, federation, clients)
+   stay stable across a restart, so only the configs/logs need rebuilding. Copy logs you want to
+   keep out of `/tmp` before finishing.
+
 ## Failover / directory / notice-queue testing (PR #4 onwards)
 
 Minimum viable topology: hub `a` (TCPServer 4242, transport) + hub `b` (4243, connects to 4242),
@@ -73,6 +93,7 @@ that is a member on `b` but `banned` on `a` (proves ban beats adoption).
 Use short timeouts or an outage takes 30 minutes:
 
 ```json
+"federation": {"sync_interval_sec": 15},
 "failover": {"enabled": true, "peer_timeout_sec": 60, "check_interval_sec": 5,
              "notify_clients": true, "notify_isolation": true},
 "directory": {"enabled": true, "min_reply_interval_sec": 60}
@@ -175,6 +196,30 @@ with framing byte `0x01` and contain no plaintext.
   *failures* rather than by waiting out that timeout, and remember a propagated delivery's callback
   means the propagation node accepted the message — the log says "handed to the propagation node
   for", not "delivered to", and the client still has to sync.
+* **Capturing a `control_queue` row before the scheduler drains it** takes a freeze, not a poll: the
+  answer is enqueued and sent within ~1-3 s. Loop on the hub log for the
+  `Operator <hash> sent: <verb>` line, `kill -STOP <hub pid>` the instant it appears, read the
+  depth from SQLite, then `kill -9` to prove durability across a crash. Content is a bonus
+  assertion: an answer generated before the kill still carries the pre-kill `egress_queue` value
+  when it is delivered after the restart.
+* **Client-side propagation sync must be driven explicitly** in a test client:
+  `router.set_outbound_propagation_node(hash)` then `router.request_messages_from_propagation_node(identity)`
+  every ~20 s. Received propagated messages arrive with `message.method == 3`
+  (`LXMF.LXMessage.PROPAGATED`), direct ones with `2`. Members who never sync legitimately never
+  see the message even though the hub row completed — do not read that as a lost delivery.
+* **Grace vs attempt semantics are directly observable**: add a member hash whose identity can
+  never be recalled, send one message, and sample
+  `select attempts, graces from egress_queue` every ~15 s. `graces` must climb (1, 2, 3 …) while
+  `attempts` stays 0, with the sampling interval stretching as the grace backoff doubles.
+* **`failover.peer_timeout_sec` is silently raised to two `federation.sync_interval_sec`** when it
+  is lower, since only a sync round refreshes liveness — otherwise a healthy peer goes stale between
+  rounds and its clients get adoption notices. So shortening a failover test means shortening
+  `sync_interval_sec` too; check the startup warning naming both settings, and remember the
+  *effective* timeout (`FailoverEngine.peer_timeout`, echoed in the adoption notice) may not be the
+  configured one when computing how long an outage must last.
+* Repeated *texts* across runs are separate messages: after federation ingest a client can log the
+  same text twice legitimately. Count `messages` rows (`select hex(msg_hash), timestamp`) and match
+  the total against `Ingested N message(s)` before calling anything a duplicate delivery.
 * Good backfill test: seed hub A while peer hub C is *down* (register C's member in C's DB
   meanwhile), then start C and expect `Ingested N message(s)` plus N deliveries — proves
   anti-entropy rather than live-only propagation.

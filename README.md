@@ -217,7 +217,7 @@ This protects a stolen disk, a copied backup, or a decommissioned SD card. It do
 
 A group's destination hash comes from that hub's own identity, so the same group on two federated hubs has two addresses, and nothing in RNS or LXMF can tell an unmodified client to switch. What's built is the honest version of failover: the surviving hub keeps delivering, and tells the human where to post.
 
-Each sync round now also exchanges `/fed/state`, where a hub reports its name, the groups it hosts, their destination hashes, and their member hashes. Liveness is the last round a peer actually answered, not the last one this hub tried, since a hub records every attempt including the failures. A peer silent for `peer_timeout_sec`, 1800 seconds or six sync intervals, is treated as down from this hub's point of view. That's local evidence, not a claim about the rest of the network.
+Each sync round now also exchanges `/fed/state`, where a hub reports its name, the groups it hosts, their destination hashes, and their member hashes. Liveness is the last round a peer actually answered, not the last one this hub tried, since a hub records every attempt including the failures. A peer silent for `peer_timeout_sec`, 1800 seconds or six sync intervals, is treated as down from this hub's point of view. That's local evidence, not a claim about the rest of the network. Because only a sync round can refresh liveness, a `peer_timeout_sec` below two `federation.sync_interval_sec` would declare a healthy peer stale between rounds and notify every client, so it is raised to that floor with a warning naming both settings.
 
 Three things then happen, all of them queued in SQLite and paced by the same token bucket as reflections, so adopting 40 members doesn't dump 40 messages onto an RF interface:
 
@@ -264,7 +264,7 @@ Storing a message and fanning it out are one transaction, because the store is a
 ## Tests
 
 ```bash
-pytest -q      # 172 tests
+pytest -q      # 175 tests
 ruff check .
 ```
 

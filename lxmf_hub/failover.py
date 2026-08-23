@@ -43,6 +43,11 @@ LIVE = "live"
 STALE = "stale"
 UNKNOWN = "unknown"
 
+# Liveness is only refreshed by a federation round, so a timeout shorter than a
+# couple of intervals calls a healthy peer dead between rounds. Equal to one
+# interval is still too tight: a single slow or lost round is enough.
+MIN_TIMEOUT_INTERVALS = 2
+
 
 def format_age(seconds: float) -> str:
     if seconds < 120:
@@ -62,6 +67,31 @@ class FailoverEngine:
         self.started_at = time.time()
         self._peers: list[bytes] = config.federation.peer_hashes
         self._last_check = 0.0
+        self.peer_timeout = self._peer_timeout()
+
+    def _peer_timeout(self) -> float:
+        """The peer timeout to actually use, raised if it undercuts sync timing.
+
+        A peer's liveness only advances when it answers a federation round, so a
+        timeout below ``MIN_TIMEOUT_INTERVALS`` sync intervals makes every hub
+        declare its healthy peers stale between rounds, adopt their members and
+        put failover notices on every client's link. That is worse than a late
+        adoption, so the floor wins over the configured value.
+        """
+        configured = self.config.failover.peer_timeout_sec
+        floor = MIN_TIMEOUT_INTERVALS * self.config.federation.sync_interval_sec
+        if not self.config.federation.enabled or configured >= floor:
+            return configured
+        RNS.log(
+            f"failover.peer_timeout_sec of {format_age(configured)} is under"
+            f" {MIN_TIMEOUT_INTERVALS} federation sync intervals"
+            f" (federation.sync_interval_sec"
+            f" {format_age(self.config.federation.sync_interval_sec)}), which would"
+            f" call a live peer stale between rounds. Using"
+            f" {format_age(floor)} instead.",
+            RNS.LOG_WARNING,
+        )
+        return floor
 
     # -- liveness --------------------------------------------------------
 
@@ -77,7 +107,7 @@ class FailoverEngine:
         of a timestamp written before the hub went down.
         """
         now = time.time() if now is None else now
-        timeout = self.config.failover.peer_timeout_sec
+        timeout = self.peer_timeout
         last_success = self.store.peer_last_success(peer_hash)
         if last_success is not None and now - last_success <= timeout:
             return LIVE
@@ -208,7 +238,7 @@ class FailoverEngine:
         destination = self.local_endpoint(group_id)
         return (
             f"{group_id}: your hub ({peer_name}) has not answered this hub for"
-            f" {format_age(self.config.failover.peer_timeout_sec)}."
+            f" {format_age(self.peer_timeout)}."
             f" {self.config.hub_name} is serving {group_id} in the meantime."
             f" To post, add this contact: {destination}."
             " You keep receiving messages here either way."
