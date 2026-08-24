@@ -156,13 +156,17 @@ class HubDaemon:
 
     def deliver(self, message: LXMF.LXMessage) -> None:
         """Route an inbound LXMF message to the control channel or a group."""
-        if self.control is not None and self.control.owns(message.destination_hash):
-            self.control.handle(message)
-            return
-        if self.directory is not None and self.directory.owns(message.destination_hash):
-            self.directory.handle(message)
-            return
-        self.hub.handle_inbound(message)
+        try:
+            if self.control is not None and self.control.owns(message.destination_hash):
+                self.control.handle(message)
+                return
+            if self.directory is not None and self.directory.owns(message.destination_hash):
+                self.directory.handle(message)
+                return
+            self.hub.handle_inbound(message)
+        except Exception as exception:
+            RNS.log(f"Delivery handling failed: {exception}", RNS.LOG_ERROR)
+            RNS.trace_exception(exception)
 
     # -- supervision -----------------------------------------------------
 
