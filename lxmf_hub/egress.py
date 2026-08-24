@@ -144,7 +144,17 @@ class EgressScheduler:
         for reply in replies:
             if self._stop.is_set():
                 return 0.5
-            self.send_control(reply)
+            try:
+                self.send_control(reply)
+            except Exception as exception:
+                RNS.log(
+                    f"Control reply {reply.item_id} to"
+                    f" {RNS.prettyhexrep(reply.recipient_hash)} failed: {exception}",
+                    RNS.LOG_ERROR,
+                )
+                RNS.trace_exception(exception)
+                self._release(KIND_CONTROL, reply.item_id)
+                self.store.defer_control(reply.item_id, self._backoff(reply.attempts))
 
         answers = self.store.due_user(self.config.egress.batch_size)
         notices = self.store.due_notices(self.config.egress.batch_size)
