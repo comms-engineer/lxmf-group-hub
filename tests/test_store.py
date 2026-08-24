@@ -245,3 +245,40 @@ def test_the_shared_deferral_helper_refuses_a_table_it_does_not_own(tmp_path):
     store = make_store(tmp_path)
     with pytest.raises(ValueError):
         store._defer("messages", 1, 1.0, True)
+
+
+def test_member_answers_are_queued_per_group_and_kept_until_delivered(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue_user(GROUP, SENDER, "first")
+    store.enqueue_user(GROUP, SENDER, "second")
+
+    queued = store.due_user(10)
+    assert [item.body for item in queued] == ["first", "second"]
+    assert [item.group_id for item in queued] == [GROUP, GROUP]
+    assert store.user_depth() == 2
+
+    store.defer_user(queued[0].item_id, 3600)
+    assert [item.item_id for item in store.due_user(10)] == [queued[1].item_id]
+    deferred = {item.item_id: item.attempts for item in store.due_user(10, now=2**31)}
+    assert deferred[queued[0].item_id] == 1
+
+    store.complete_user(queued[1].item_id)
+    assert store.user_depth() == 1
+
+
+def test_a_database_written_before_personas_existed_still_opens(tmp_path):
+    """The persona tables are added to a hub that has been running for months."""
+    path = str(tmp_path / "hub.db")
+    store = make_store(tmp_path)
+    store.store_and_enqueue(make_message(), [SENDER])
+    for table in ("persona_links", "persona_identities", "personas"):
+        store._db.execute(f"DROP TABLE {table}")
+    store._db.execute("DROP TABLE user_queue")
+    store._db.commit()
+    store.close()
+
+    reopened = Store(path)
+
+    assert reopened.egress_depth() == 1
+    assert reopened.list_personas() == []
+    assert reopened.user_depth() == 0

@@ -26,5 +26,9 @@
   "directory": {
     "enabled": true,
     "min_reply_interval_sec": 60
+  },
+  "commands": {
+    "enabled": true,
+    "min_reply_interval_sec": 10
   }
 }

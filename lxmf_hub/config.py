@@ -96,6 +96,17 @@ class DirectoryConfig:
 
 
 @dataclass
+class CommandsConfig:
+    """Commands members send as ordinary group messages."""
+
+    enabled: bool = True
+    # One answer per sender per interval. A command is a message like any other,
+    # so without this a client stuck in a resend loop makes the hub transmit an
+    # answer for every copy.
+    min_reply_interval_sec: float = 10.0
+
+
+@dataclass
 class AtRestConfig:
     """At-rest encryption of message payloads and group private keys."""
 
@@ -126,6 +137,7 @@ class HubConfig:
     federation: FederationConfig = field(default_factory=FederationConfig)
     failover: FailoverConfig = field(default_factory=FailoverConfig)
     directory: DirectoryConfig = field(default_factory=DirectoryConfig)
+    commands: CommandsConfig = field(default_factory=CommandsConfig)
 
     @property
     def resolved_storage_path(self) -> str:

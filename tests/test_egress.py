@@ -389,6 +389,76 @@ def test_notice_attempts_are_capped(tmp_path, monkeypatch):
     assert store.notice_depth() == 0
 
 
+def test_an_answer_stays_queued_until_it_is_delivered(tmp_path, monkeypatch):
+    """A restart or a failed send must not lose a member's answer."""
+    scheduler, store, _router, _record = build(tmp_path, monkeypatch)
+    store.enqueue_user(GROUP, MEMBER, "hub-one: up 1h")
+    sent = _stub_message()
+    monkeypatch.setattr(scheduler.hub, "build_notice", lambda group_id, identity, body: sent)
+
+    scheduler.tick()
+
+    assert store.user_depth() == 1
+    sent.failed(sent)
+    assert store.user_depth() == 1
+    scheduler.tick()
+    sent.delivered(sent)
+    assert store.user_depth() == 0
+
+
+def test_an_answer_is_paced_with_the_client_tokens(tmp_path, monkeypatch):
+    """A member asking for status may not spend all of the group's airtime."""
+    config = HubConfig()
+    config.egress.tokens_per_second = 0.0
+    config.egress.burst = 1
+    scheduler, store, router, _record = build(tmp_path, monkeypatch, config=config)
+    store.enqueue_user(GROUP, MEMBER, "first")
+    store.enqueue_user(GROUP, MEMBER, "second")
+    monkeypatch.setattr(
+        scheduler.hub, "build_notice", lambda group_id, identity, body: _stub_message()
+    )
+
+    scheduler.tick()
+
+    assert len(router.sent) == 1
+    assert store.user_depth() == 2
+
+
+def test_an_answer_for_an_unknown_identity_waits_for_a_path(tmp_path, monkeypatch):
+    scheduler, store, router, _record = build(tmp_path, monkeypatch, identity=None)
+    store.enqueue_user(GROUP, MEMBER, "hello")
+
+    scheduler.tick()
+
+    assert router.sent == []
+    assert store.due_user(10, now=2**31)[0].attempts == 0
+
+
+def test_answer_attempts_are_capped(tmp_path, monkeypatch):
+    config = HubConfig()
+    config.egress.max_attempts = 2
+    scheduler, store, _router, _record = build(tmp_path, monkeypatch, config=config)
+    store.enqueue_user(GROUP, MEMBER, "hello")
+
+    item = store.due_user(1)[0]
+    store.defer_user(item.item_id, -1)
+    store.defer_user(item.item_id, -1)
+    scheduler.tick()
+
+    assert store.user_depth() == 0
+
+
+def test_an_answer_for_a_detached_group_keeps_its_attempts(tmp_path, monkeypatch):
+    scheduler, store, router, _record = build(tmp_path, monkeypatch)
+    scheduler.destinations._mapping.clear()
+    store.enqueue_user(GROUP, MEMBER, "hello")
+
+    scheduler.tick()
+
+    assert router.sent == []
+    assert store.due_user(10, now=2**31)[0].attempts == 0
+
+
 class StubMessage:
     """Enough of LXMessage for the scheduler: a method slot and two callbacks."""
 

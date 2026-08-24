@@ -158,6 +158,66 @@ CREATE TABLE IF NOT EXISTS control_queue (
 
 CREATE INDEX IF NOT EXISTS idx_control_due ON control_queue (next_attempt_at);
 
+-- Answers to a member's own commands (``/name``, ``/whoami``). Separate from
+-- notice_queue for the same reason control_queue is: a notice is deduplicated on
+-- (recipient, body) because two identical failover notices are one piece of
+-- news, while two ``/whoami`` messages deserve two answers even though the text
+-- is identical. Unlike control_queue these are ordinary client traffic, so they
+-- go out from the group destination and spend client tokens.
+CREATE TABLE IF NOT EXISTS user_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        TEXT NOT NULL,
+    recipient_hash  BLOB NOT NULL,
+    body            TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    graces          INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL,
+    created_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_due ON user_queue (next_attempt_at);
+
+-- A person, as opposed to one of their devices. ``persona_id`` is 16 random
+-- bytes minted where the persona is claimed, so hubs never have to agree on an
+-- id space. ``name_folded`` is the case-insensitive form the uniqueness index
+-- and every lookup use; ``name`` keeps the capitalisation the owner typed.
+-- ``revision`` orders updates during federation merges, and a NULL name is a
+-- real state: a persona that lost a name conflict keeps its devices.
+CREATE TABLE IF NOT EXISTS personas (
+    persona_id  BLOB PRIMARY KEY,
+    name        TEXT,
+    name_folded TEXT,
+    claimed_at  REAL NOT NULL,
+    revision    INTEGER NOT NULL DEFAULT 1,
+    updated_at  REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_personas_name ON personas (name_folded);
+
+-- Which LXMF identities are that person. One identity belongs to at most one
+-- persona, several identities to one persona is the multi-device case.
+-- ``removed_at`` is a tombstone rather than a delete: an unlink has to
+-- replicate, and a peer that only ever saw the link would otherwise hand the
+-- device back on the next sync round.
+CREATE TABLE IF NOT EXISTS persona_identities (
+    user_hash  BLOB PRIMARY KEY,
+    persona_id BLOB NOT NULL,
+    added_at   REAL NOT NULL,
+    removed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_persona_identities ON persona_identities (persona_id);
+
+-- One-time codes a member's first device mints so a second device can join the
+-- same persona. Deliberately local: a code is short-lived and single-use, so
+-- replicating it would only widen where it can be replayed.
+CREATE TABLE IF NOT EXISTS persona_links (
+    code       TEXT PRIMARY KEY,
+    persona_id BLOB NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -204,7 +264,7 @@ SOURCE_DIRECTORY = "directory"
 
 # Tables the shared deferral helper may write to. Named here so the table cannot
 # reach the statement from anywhere but this module.
-QUEUE_TABLES = frozenset({"egress_queue", "notice_queue", "control_queue"})
+QUEUE_TABLES = frozenset({"egress_queue", "notice_queue", "control_queue", "user_queue"})
 
 
 @dataclass(frozen=True)
@@ -228,6 +288,46 @@ class ControlItem:
 
 
 @dataclass(frozen=True)
+class UserItem:
+    item_id: int
+    group_id: str
+    recipient_hash: bytes
+    body: str
+    attempts: int
+    graces: int = 0
+
+
+@dataclass(frozen=True)
+class PersonaRecord:
+    persona_id: bytes
+    name: str | None
+    claimed_at: float
+    revision: int
+    updated_at: float
+
+    @property
+    def name_folded(self) -> str | None:
+        return fold_name(self.name)
+
+
+@dataclass(frozen=True)
+class PersonaIdentity:
+    user_hash: bytes
+    persona_id: bytes
+    added_at: float
+    removed_at: float | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.removed_at is None
+
+    @property
+    def version(self) -> float:
+        """How recent this row is, for merging one hub's row against another's."""
+        return max(self.added_at, self.removed_at or 0.0)
+
+
+@dataclass(frozen=True)
 class PeerGroup:
     peer_hash: bytes
     group_id: str
@@ -235,6 +335,18 @@ class PeerGroup:
     hub_name: str
     acl_mode: str
     updated_at: float
+
+
+def fold_name(name: str | None) -> str | None:
+    """The case-insensitive form of a username, or None.
+
+    Case folding rather than lowercasing: two names that differ only in case are
+    the same name to a reader, and ``casefold`` gets the non-ASCII pairs that
+    ``lower`` does not.
+    """
+    if name is None:
+        return None
+    return name.casefold()
 
 
 def group_hash(group_id: str) -> bytes:
@@ -776,6 +888,15 @@ class Store:
             ).fetchall()
         return [row["user_hash"] for row in rows]
 
+    def adopted_for_peer(self, peer_hash: bytes, group_id: str) -> list[bytes]:
+        """The members of one peer's group this hub is currently serving."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT user_hash FROM adoptions WHERE peer_hash = ? AND group_id = ?",
+                (peer_hash, group_id),
+            ).fetchall()
+        return [row["user_hash"] for row in rows]
+
     def is_adopted(self, group_id: str, user_hash: bytes) -> bool:
         with self._lock:
             row = self._db.execute(
@@ -885,6 +1006,307 @@ class Store:
     def defer_control(self, item_id: int, delay: float, count_attempt: bool = True) -> None:
         self._defer("control_queue", item_id, delay, count_attempt)
 
+    # -- user answer queue -----------------------------------------------
+
+    def enqueue_user(self, group_id: str, recipient_hash: bytes, body: str) -> int:
+        """Queue an answer to a member's own command. Never deduplicated."""
+        now = time.time()
+        with self._lock:
+            cursor = self._db.execute(
+                "INSERT INTO user_queue"
+                " (group_id, recipient_hash, body, attempts, next_attempt_at, created_at)"
+                " VALUES (?, ?, ?, 0, ?, ?)",
+                (group_id, recipient_hash, body, now, now),
+            )
+            self._db.commit()
+        return int(cursor.lastrowid or 0)
+
+    def due_user(self, limit: int, now: float | None = None) -> list[UserItem]:
+        now = time.time() if now is None else now
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM user_queue WHERE next_attempt_at <= ?"
+                " ORDER BY next_attempt_at, id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+        return [
+            UserItem(
+                item_id=row["id"],
+                group_id=row["group_id"],
+                recipient_hash=row["recipient_hash"],
+                body=row["body"],
+                attempts=row["attempts"],
+                graces=row["graces"],
+            )
+            for row in rows
+        ]
+
+    def user_depth(self) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT COUNT(*) AS depth FROM user_queue").fetchone()
+        return int(row["depth"])
+
+    def complete_user(self, item_id: int) -> None:
+        with self._lock:
+            self._db.execute("DELETE FROM user_queue WHERE id = ?", (item_id,))
+            self._db.commit()
+
+    def defer_user(self, item_id: int, delay: float, count_attempt: bool = True) -> None:
+        self._defer("user_queue", item_id, delay, count_attempt)
+
+    # -- personas --------------------------------------------------------
+
+    def create_persona(
+        self,
+        persona_id: bytes,
+        name: str | None,
+        user_hash: bytes,
+        claimed_at: float | None = None,
+    ) -> PersonaRecord:
+        """Mint a persona and attach its first device, in one transaction.
+
+        A persona with no device is unreachable and a device attached to a
+        persona that does not exist resolves to nothing, so neither half is ever
+        committed alone.
+        """
+        now = time.time()
+        claimed_at = now if claimed_at is None else claimed_at
+        record = PersonaRecord(
+            persona_id=persona_id,
+            name=name,
+            claimed_at=claimed_at,
+            revision=1,
+            updated_at=now,
+        )
+        with self._lock:
+            try:
+                self._db.execute(
+                    "INSERT INTO personas"
+                    " (persona_id, name, name_folded, claimed_at, revision, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (persona_id, name, fold_name(name), claimed_at, 1, now),
+                )
+                self._db.execute(
+                    "INSERT INTO persona_identities (user_hash, persona_id, added_at, removed_at)"
+                    " VALUES (?, ?, ?, NULL)"
+                    " ON CONFLICT (user_hash) DO UPDATE SET"
+                    " persona_id = excluded.persona_id, added_at = excluded.added_at,"
+                    " removed_at = NULL",
+                    (user_hash, persona_id, now),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return record
+
+    def get_persona(self, persona_id: bytes) -> PersonaRecord | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM personas WHERE persona_id = ?", (persona_id,)
+            ).fetchone()
+        return _persona_from_row(row) if row else None
+
+    def persona_by_name(self, name: str) -> PersonaRecord | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM personas WHERE name_folded = ?", (fold_name(name),)
+            ).fetchone()
+        return _persona_from_row(row) if row else None
+
+    def persona_for_identity(self, user_hash: bytes) -> PersonaRecord | None:
+        """The persona a device belongs to, ignoring unlinked ones."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT personas.* FROM personas"
+                " JOIN persona_identities USING (persona_id)"
+                " WHERE persona_identities.user_hash = ?"
+                " AND persona_identities.removed_at IS NULL",
+                (user_hash,),
+            ).fetchone()
+        return _persona_from_row(row) if row else None
+
+    def list_personas(self) -> list[PersonaRecord]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM personas ORDER BY name_folded IS NULL, name_folded"
+            ).fetchall()
+        return [_persona_from_row(row) for row in rows]
+
+    def persona_devices(
+        self, persona_id: bytes, include_removed: bool = False
+    ) -> list[PersonaIdentity]:
+        query = "SELECT * FROM persona_identities WHERE persona_id = ?"
+        if not include_removed:
+            query += " AND removed_at IS NULL"
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY added_at", (persona_id,)).fetchall()
+        return [_identity_from_row(row) for row in rows]
+
+    def display_name_for(self, user_hash: bytes) -> str | None:
+        """The username to attribute a message to, or None for an unnamed device."""
+        persona = self.persona_for_identity(user_hash)
+        return persona.name if persona is not None else None
+
+    def set_persona_name(
+        self,
+        persona_id: bytes,
+        name: str | None,
+        revision: int | None = None,
+        updated_at: float | None = None,
+    ) -> None:
+        """Rename a persona, or clear its name with ``None``.
+
+        The revision is bumped unless one is supplied, which is what a federation
+        merge does when it is replaying a peer's revision rather than making a
+        change of its own.
+        """
+        now = time.time() if updated_at is None else updated_at
+        with self._lock:
+            if revision is None:
+                self._db.execute(
+                    "UPDATE personas SET name = ?, name_folded = ?, revision = revision + 1,"
+                    " updated_at = ? WHERE persona_id = ?",
+                    (name, fold_name(name), now, persona_id),
+                )
+            else:
+                self._db.execute(
+                    "UPDATE personas SET name = ?, name_folded = ?, revision = ?,"
+                    " updated_at = ? WHERE persona_id = ?",
+                    (name, fold_name(name), revision, now, persona_id),
+                )
+            self._db.commit()
+
+    def upsert_persona(self, record: PersonaRecord) -> None:
+        """Write a peer's persona row verbatim, for federation merges."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO personas"
+                " (persona_id, name, name_folded, claimed_at, revision, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (persona_id) DO UPDATE SET"
+                " name = excluded.name, name_folded = excluded.name_folded,"
+                " claimed_at = excluded.claimed_at, revision = excluded.revision,"
+                " updated_at = excluded.updated_at",
+                (
+                    record.persona_id,
+                    record.name,
+                    record.name_folded,
+                    record.claimed_at,
+                    record.revision,
+                    record.updated_at,
+                ),
+            )
+            self._db.commit()
+
+    def link_identity(
+        self, persona_id: bytes, user_hash: bytes, added_at: float | None = None
+    ) -> None:
+        """Attach a device to a persona, moving it off any previous one."""
+        now = time.time() if added_at is None else added_at
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO persona_identities (user_hash, persona_id, added_at, removed_at)"
+                " VALUES (?, ?, ?, NULL)"
+                " ON CONFLICT (user_hash) DO UPDATE SET"
+                " persona_id = excluded.persona_id, added_at = excluded.added_at,"
+                " removed_at = NULL",
+                (user_hash, persona_id, now),
+            )
+            self._db.commit()
+
+    def unlink_identity(self, user_hash: bytes, removed_at: float | None = None) -> bool:
+        """Tombstone a device. Returns False if it was not linked."""
+        now = time.time() if removed_at is None else removed_at
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE persona_identities SET removed_at = ?"
+                " WHERE user_hash = ? AND removed_at IS NULL",
+                (now, user_hash),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def upsert_persona_identity(self, row: PersonaIdentity) -> None:
+        """Write a peer's device row verbatim, tombstone included."""
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO persona_identities (user_hash, persona_id, added_at, removed_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (user_hash) DO UPDATE SET"
+                " persona_id = excluded.persona_id, added_at = excluded.added_at,"
+                " removed_at = excluded.removed_at",
+                (row.user_hash, row.persona_id, row.added_at, row.removed_at),
+            )
+            self._db.commit()
+
+    def list_persona_identities(self) -> list[PersonaIdentity]:
+        """Every device row including tombstones, for federation."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM persona_identities").fetchall()
+        return [_identity_from_row(row) for row in rows]
+
+    def get_persona_identity(self, user_hash: bytes) -> PersonaIdentity | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM persona_identities WHERE user_hash = ?", (user_hash,)
+            ).fetchone()
+        return _identity_from_row(row) if row else None
+
+    # -- device link codes -----------------------------------------------
+
+    def create_link_code(self, code: str, persona_id: bytes, expires_at: float) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO persona_links (code, persona_id, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (code) DO UPDATE SET"
+                " persona_id = excluded.persona_id, created_at = excluded.created_at,"
+                " expires_at = excluded.expires_at",
+                (code, persona_id, time.time(), expires_at),
+            )
+            self._db.commit()
+
+    def claim_link_code(self, code: str, now: float | None = None) -> bytes | None:
+        """Spend a link code. Returns the persona it belonged to, or None.
+
+        The delete and the read are one transaction, so two devices racing on the
+        same code cannot both join: the second one finds it spent.
+        """
+        now = time.time() if now is None else now
+        with self._lock:
+            try:
+                row = self._db.execute(
+                    "SELECT persona_id, expires_at FROM persona_links WHERE code = ?", (code,)
+                ).fetchone()
+                if row is None:
+                    self._db.commit()
+                    return None
+                self._db.execute("DELETE FROM persona_links WHERE code = ?", (code,))
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        if row["expires_at"] < now:
+            return None
+        return row["persona_id"]
+
+    def prune_link_codes(self, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        with self._lock:
+            cursor = self._db.execute("DELETE FROM persona_links WHERE expires_at < ?", (now,))
+            self._db.commit()
+        return cursor.rowcount
+
+    def groups_for_member(self, user_hash: bytes) -> list[str]:
+        """Groups a device is a member of, so an answer has a source to go out from."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT group_id FROM members WHERE user_hash = ? AND role != ? ORDER BY group_id",
+                (user_hash, ROLE_BANNED),
+            ).fetchall()
+        return [row["group_id"] for row in rows]
+
     # -- shared queue helpers --------------------------------------------
 
     def _defer(self, table: str, item_id: int, delay: float, count_attempt: bool) -> None:
@@ -946,6 +1368,25 @@ class Store:
             )
             self._db.commit()
         return cursor.rowcount
+
+
+def _persona_from_row(row: sqlite3.Row) -> PersonaRecord:
+    return PersonaRecord(
+        persona_id=row["persona_id"],
+        name=row["name"],
+        claimed_at=row["claimed_at"],
+        revision=row["revision"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _identity_from_row(row: sqlite3.Row) -> PersonaIdentity:
+    return PersonaIdentity(
+        user_hash=row["user_hash"],
+        persona_id=row["persona_id"],
+        added_at=row["added_at"],
+        removed_at=row["removed_at"],
+    )
 
 
 def _chunks(items: list[bytes], size: int) -> Iterable[list[bytes]]:

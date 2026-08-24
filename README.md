@@ -93,6 +93,10 @@ Every key is optional. The values below are the built-in defaults.
   "directory": {
     "enabled": true,
     "min_reply_interval_sec": 60
+  },
+  "commands": {
+    "enabled": true,
+    "min_reply_interval_sec": 10
   }
 }
 ```
@@ -128,19 +132,22 @@ The control hash comes from `lxmf-hub status` or the startup log line `Operator 
 
 ## Reflection and author attribution
 
-A reflected message is a new LXMF message from the group destination to one member, not a forwarded copy of the original. Attribution rides in the LXMF fields dictionary under `author_field`, as a three-key dict:
+A reflected message is a new LXMF message from the group destination to one member, not a forwarded copy of the original. Attribution rides in the LXMF fields dictionary under `author_field`, as a four-key dict:
 
 ```python
 fields[253] = {
     "author": b"\xde\xef\x7e\xab...",  # the original sender's LXMF destination hash
     "group":  "ops",                   # the logical group id, identical on every hub
     "hub":    b"\xb1\x96\xe0\xeb...",  # the group destination this hub reflected from
+    "name":   "alice",                 # the sender's username, or None if they have none
 }
 ```
 
+`name` is a convenience, never an identity: it is whatever username the sender's persona holds at reflection time, and `author` stays on the message so a client that verifies authorship verifies a key, not a string. A sender with no username gets `None` and the hash-prefixed body clients already handle.
+
 The default index is `0xFD`, which LXMF defines as `FIELD_CUSTOM_META`. The original spec for this project called for `Fields[0x01]`, and that index is taken: LXMF assigns `0x01` to `FIELD_EMBEDDED_LXMS`, so a client that honors the spec will try to parse the attribution dict as a list of embedded messages. Set `"author_field": 1` if your clients expect it there anyway.
 
-Clients that render only text still need to know who wrote what, so `author_prefix_in_content` prepends the sender's hash to the body. The prefix is applied when the reflection is built, not when the message is stored, which keeps the stored payload byte-identical to what the author sent and keeps the message hash stable across hubs.
+Clients that render only text still need to know who wrote what, so `author_prefix_in_content` prepends the sender's username to the body, falling back to their hash when they have no username. The prefix is applied when the reflection is built, not when the message is stored, which keeps the stored payload byte-identical to what the author sent and keeps the message hash stable across hubs.
 
 Any value a sender puts in field 253 is stripped before storage. Otherwise a member could hand-craft a message claiming to come from an admin.
 
@@ -184,6 +191,7 @@ A sync round every `sync_interval_sec` opens an RNS Link, identifies with the hu
 | `/fed/tree` | group, epoch, level, node indices | node hashes at that level, up to 1024 per request |
 | `/fed/bucket` | group, epoch, leaf indices | message hashes in those buckets, up to 64 buckets |
 | `/fed/fetch` | group, message hashes | count, then an RNS Resource carrying the batch |
+| `/fed/personas` | protocol version | personas and device links, including unlink tombstones |
 
 Only epochs whose roots differ are walked, and the walk descends 8 levels asking for the children of nodes that disagree. Missing hashes are fetched in batches of 256 as `RNS.Resource` payloads, never as individual LXMF packets, then ingested with the same `INSERT OR IGNORE` path local messages use and fanned out to local members.
 
@@ -249,6 +257,55 @@ Peer lines come from `/fed/state` gossip, so the age is when this hub last heard
 
 Answers are queued and paced like any other client egress, and repeat queries from the same hash inside `min_reply_interval_sec` are dropped, so the directory can't be used to make a hub transmit on demand. Unsigned messages are dropped. The listing covers 40 groups.
 
+## Usernames and multi-device personas
+
+A username belongs to a persona, not to a destination hash, because one person is a phone, a node at home, and a laptop. `personas` holds the name, `persona_identities` maps each LXMF destination hash to one persona, and a message from any of those hashes is attributed to the same name on every hub in the federation.
+
+```
+/name alice        ->  You are alice on every hub in this federation, from 1 device(s).
+/link              ->  Send '/link 4F2K9Q' from your other device within 15m. The code works once.
+/link 4F2K9Q       ->  This device is now alice, 2 device(s) in total.
+/whoami            ->  alice (persona 9c2f...)
+                         8f1c0d7a...  <- this device
+                         b3e07741...
+/unlink b3e07741   ->  b3e07741... is no longer alice, 1 device(s) left.
+```
+
+Names are unique per federation, compared with `str.casefold()` and displayed as typed, so `Alice` and `alice` are one name and the capitalisation the owner chose survives. A device belongs to at most one persona at a time, and the last device of a named persona can't be unlinked, since a name nobody can post under is a name nobody can release either.
+
+Link codes never leave the hub that minted them. They are six characters from an alphabet with no `0/O` or `1/I`, single-use, and expire in 15 minutes; the second device proves nothing but possession of the code, which is the same trust model as pairing a device by reading a number off a screen.
+
+Every sync round also runs `/fed/personas`, which returns the persona rows and the device rows, tombstones included. A tombstone is why an unlink sticks: a peer that still remembers the link would otherwise re-add the device on the next round, and "my old phone keeps posting as me" is not a bug a member can work around. Rows merge on `(revision, updated_at)`, and the exchange is wrapped so a peer that doesn't answer the path -- an older hub -- costs nothing but a log line while message reconciliation continues.
+
+Two hubs partitioned from each other can both hand out `alice`. When they meet, the earlier `(claimed_at, persona_id)` keeps the name and the later one loses it, which every hub computes identically from the rows themselves, so the mesh converges without a coordinator or a clock they both trust. The loser keeps its devices and its persona and is told, in the group, that the name went to an earlier claim.
+
+## In-band commands
+
+An unmodified LXMF client has no UI for a hub, so a member's only channel is a message to the group. A message whose first token is a known verb is consumed and answered instead of reflected; everything else is a message, including anything that merely starts with a slash, so `/etc/hosts is the file` still posts. Verbs are case-insensitive and a line over 1024 bytes isn't a command.
+
+```
+/help    /status    /name    /whoami    /link    /unlink    /who    /names
+```
+
+`/help` lists those with usage. Sent by an operator it also lists the control commands, generated from the same argparse definitions the control channel answers with, and says they go to the control address rather than the group -- the operator surface stays off the group either way.
+
+`/status` is the situational-awareness answer, and deliberately reports what failover acts on rather than a second opinion computed differently:
+
+```
+Example Hub: up 3d 4h, 2 group(s), 1 peer hub(s)
+you: alice, 2 device(s), posting from 8f1c0d7a...
+ops (invite): 7 member(s) here, 3 adopted, 5 named
+  b196e0eb...  this hub
+  7d41c9a2...  Standby Hub, answered 4m ago, 3 of its member(s) served here
+federation: 1/1 peer(s) answering, sync every 5m, a peer counts as down after 10m
+queues: 4 message(s), 0 notice(s), 1 answer(s) waiting to go out
+operator: 0 control answer(s) queued, 5/6 persona(s) named, egress 0.5/s burst 4
+```
+
+The peer age is the last round that peer actually answered, and the down threshold is the same clamped `peer_timeout_sec` failover uses, so a member reading `/status` and a hub deciding to adopt members can't disagree. The local address is read from the live destination rather than derived, so it is the address to post to and not the address the config implies. A malformed peer entry is reported as no peers instead of failing the command, because an operator's typo shouldn't take `/status` down with it.
+
+Answers go on the durable user queue: they survive an unknown path, a failed delivery, and a restart, are paced by the same token bucket as reflections, and are rate-limited per sender by `commands.min_reply_interval_sec`. A repeat inside that window is still swallowed -- answering it would be a hub that can be made to transmit on demand, and reflecting it would put a member's `/status` flood into the group. Command interception happens after the ACL check, so a banned hash gets no answer and no reflection. Every failure path returns text, including argument errors and malformed hashes, because a member with no answer can't tell a rejected command from a hub that stopped listening.
+
 ## What this doesn't do
 
 Failover is a notice, not a redirect. A member has to add the standby contact themselves, and a client with no one at either address just fails in its own outbound queue as before. Transparent failover would need the group's private key on every hub, which trades the group's forward secrecy and blast radius for saving the member one paste; that isn't built.
@@ -264,7 +321,7 @@ Storing a message and fanning it out are one transaction, because the store is a
 ## Tests
 
 ```bash
-pytest -q      # 175 tests
+pytest -q      # 239 tests
 ruff check .
 ```
 
@@ -282,8 +339,7 @@ python tools/local_testnet.py client --name alice --connect 4242 --send-to <grou
 
 Hub b joins the federation with `--port 4243 --connect 4242 --peer <hub_a_federation_hash>`, where that hash is printed at hub a's startup. Set `TESTNET_LOGLEVEL=7` for per-message hub and federation output.
 
-## To-Do
-- Per-user username setting, for message prefixes
+Personas and commands add: claiming, renaming and case-folded uniqueness, multi-device linking with one-time and expired codes, unlink tombstones surviving a federation round, deterministic convergence of two conflicting claims across two merge rounds, persona-name attribution alongside the author hash, known verbs consumed while a slash-prefixed message is reflected, a banned sender getting no answer, durable answers across a failed delivery, and opening a database written before the persona tables existed.
 
 ## Licence
 
