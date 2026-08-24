@@ -171,6 +171,9 @@ class HubDaemon:
     # -- supervision -----------------------------------------------------
 
     def run(self) -> None:
+        import faulthandler
+        import signal
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
         self.start()
         self.supervise()
 
