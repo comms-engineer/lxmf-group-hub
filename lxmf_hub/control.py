@@ -111,7 +111,14 @@ class ControlChannel:
             f"Operator {RNS.prettyhexrep(message.source_hash)} sent: {command}",
             RNS.LOG_NOTICE,
         )
-        self.reply(message.source_hash, self.execute(command))
+        try:
+            answer = self.execute(command)
+            RNS.log(f"Operator command produced: {answer!r}", RNS.LOG_NOTICE)
+            self.reply(message.source_hash, answer)
+            RNS.log("Operator reply queued", RNS.LOG_NOTICE)
+        except Exception as exception:
+            RNS.log(f"Control handling blew up: {exception}", RNS.LOG_ERROR)
+            RNS.trace_exception(exception)
 
     def execute(self, command: str) -> str:
         """Run one operator command line and return the text to send back.
