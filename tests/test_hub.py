@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 from lxmf_hub.config import HubConfig
 from lxmf_hub.hub import META_AUTHOR, GroupHub, pack_payload, unpack_payload
+from lxmf_hub.personas import PersonaRegistry
 from lxmf_hub.store import ACL_INVITE, ACL_PUBLIC, ROLE_BANNED, Store, message_hash
+from lxmf_hub.usercmds import UserCommands
 
 GROUP = "ops"
 GROUP_DESTINATION = bytes.fromhex("aabbccddeeff00112233445566778899")
@@ -178,3 +180,42 @@ def test_federated_ingest_ignores_unknown_groups(tmp_path):
     hub, store = make_hub(tmp_path)
     payload = pack_payload(1.0, b"", b"x", {})
     assert hub.ingest_federated([("unknown", ALICE, 1.0, payload)]) == 0
+
+
+def command_hub(tmp_path):
+    config = HubConfig()
+    config.commands.min_reply_interval_sec = 0.0
+    hub, store = make_hub(tmp_path, acl_mode=ACL_PUBLIC, config=config)
+    hub.commands = UserCommands(config, store, PersonaRegistry(store), hub.destinations)
+    return hub, store
+
+
+def test_a_command_is_answered_instead_of_being_reflected(tmp_path):
+    hub, store = command_hub(tmp_path)
+    store.add_member(GROUP, BOB)
+
+    hub.handle_inbound(inbound(source=ALICE, content=b"/name alice"))
+
+    assert store.group_history(GROUP) == []
+    assert store.egress_depth() == 0
+    assert store.user_depth() == 1
+    assert store.display_name_for(ALICE) == "alice"
+
+
+def test_a_message_that_merely_starts_with_a_slash_is_posted(tmp_path):
+    hub, store = command_hub(tmp_path)
+    store.add_member(GROUP, BOB)
+
+    hub.handle_inbound(inbound(source=ALICE, content=b"/etc/hosts needs a line"))
+
+    assert len(store.group_history(GROUP)) == 1
+    assert store.user_depth() == 0
+
+
+def test_a_banned_sender_gets_no_command_answer(tmp_path):
+    hub, store = command_hub(tmp_path)
+    store.add_member(GROUP, ALICE, ROLE_BANNED)
+
+    hub.handle_inbound(inbound(source=ALICE, content=b"/status"))
+
+    assert store.user_depth() == 0

@@ -49,6 +49,35 @@ UNKNOWN = "unknown"
 MIN_TIMEOUT_INTERVALS = 2
 
 
+def effective_peer_timeout(config: HubConfig, warn: bool = False) -> float:
+    """The peer timeout to actually use, raised if it undercuts sync timing.
+
+    A peer's liveness only advances when it answers a federation round, so a
+    timeout below ``MIN_TIMEOUT_INTERVALS`` sync intervals makes every hub
+    declare its healthy peers stale between rounds, adopt their members and put
+    failover notices on every client's link. That is worse than a late adoption,
+    so the floor wins over the configured value.
+
+    Shared with anything that reports liveness -- ``/status`` included -- so a
+    reader is never told a peer is stale by a rule the engine does not use.
+    """
+    configured = config.failover.peer_timeout_sec
+    floor = MIN_TIMEOUT_INTERVALS * config.federation.sync_interval_sec
+    if not config.federation.enabled or configured >= floor:
+        return configured
+    if warn:
+        RNS.log(
+            f"failover.peer_timeout_sec of {format_age(configured)} is under"
+            f" {MIN_TIMEOUT_INTERVALS} federation sync intervals"
+            f" (federation.sync_interval_sec"
+            f" {format_age(config.federation.sync_interval_sec)}), which would"
+            f" call a live peer stale between rounds. Using"
+            f" {format_age(floor)} instead.",
+            RNS.LOG_WARNING,
+        )
+    return floor
+
+
 def format_age(seconds: float) -> str:
     if seconds < 120:
         return f"{int(seconds)}s"
@@ -70,28 +99,7 @@ class FailoverEngine:
         self.peer_timeout = self._peer_timeout()
 
     def _peer_timeout(self) -> float:
-        """The peer timeout to actually use, raised if it undercuts sync timing.
-
-        A peer's liveness only advances when it answers a federation round, so a
-        timeout below ``MIN_TIMEOUT_INTERVALS`` sync intervals makes every hub
-        declare its healthy peers stale between rounds, adopt their members and
-        put failover notices on every client's link. That is worse than a late
-        adoption, so the floor wins over the configured value.
-        """
-        configured = self.config.failover.peer_timeout_sec
-        floor = MIN_TIMEOUT_INTERVALS * self.config.federation.sync_interval_sec
-        if not self.config.federation.enabled or configured >= floor:
-            return configured
-        RNS.log(
-            f"failover.peer_timeout_sec of {format_age(configured)} is under"
-            f" {MIN_TIMEOUT_INTERVALS} federation sync intervals"
-            f" (federation.sync_interval_sec"
-            f" {format_age(self.config.federation.sync_interval_sec)}), which would"
-            f" call a live peer stale between rounds. Using"
-            f" {format_age(floor)} instead.",
-            RNS.LOG_WARNING,
-        )
-        return floor
+        return effective_peer_timeout(self.config, warn=True)
 
     # -- liveness --------------------------------------------------------
 

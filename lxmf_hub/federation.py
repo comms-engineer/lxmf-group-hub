@@ -14,6 +14,12 @@ One sync round with a peer:
 4. ``/fed/fetch``  -- ask for the missing messages; the peer answers with an RNS
    Resource carrying the batch, which is ingested into the local store.
 
+``/fed/personas`` replicates usernames: the full persona set and its device rows,
+including unlink tombstones, merged by revision with a deterministic rule for a
+name two partitioned hubs both claimed. It is the same shape of state exchange as
+``/fed/state`` and equally non-fatal -- a peer that cannot answer it still gets
+its messages reconciled.
+
 ``/fed/state`` runs alongside as the round's first request. It carries what the
 peer serves rather than what it holds: hub name, one destination hash per group,
 and the member set of each group. That's what lets a hub answer directory
@@ -35,7 +41,9 @@ from .config import HubConfig
 from .destinations import group_destination_hash
 from .hub import GroupHub
 from .merkle import PrefixMerkleTree, children_of, diverging_nodes
-from .store import Store
+from .personas import PersonaRegistry
+from .store import PersonaIdentity, PersonaRecord, Store
+from .usercmds import UserCommands
 
 FED_APP_NAME = "lxmfhub"
 FED_ASPECT = "federation"
@@ -45,6 +53,15 @@ PATH_TREE = "/fed/tree"
 PATH_BUCKET = "/fed/bucket"
 PATH_FETCH = "/fed/fetch"
 PATH_STATE = "/fed/state"
+PATH_PERSONAS = "/fed/personas"
+
+# A persona row is small, there is one per person rather than one per message,
+# and a hub that answers with a truncated set would leave the caller unable to
+# tell a released name from one it simply did not receive. So the whole set goes
+# in one answer, with a ceiling that only a hub with an implausible number of
+# users reaches.
+MAX_PERSONAS_PER_RESPONSE = 4096
+MAX_IDENTITIES_PER_RESPONSE = MAX_PERSONAS_PER_RESPONSE * 4
 
 PROTOCOL_VERSION = 1
 
@@ -71,11 +88,23 @@ class SyncState:
 
 
 class FederationEngine:
-    def __init__(self, config: HubConfig, store: Store, hub: GroupHub, identity: RNS.Identity):
+    def __init__(
+        self,
+        config: HubConfig,
+        store: Store,
+        hub: GroupHub,
+        identity: RNS.Identity,
+        registry: PersonaRegistry | None = None,
+        commands: UserCommands | None = None,
+    ):
         self.config = config
         self.store = store
         self.hub = hub
         self.identity = identity
+        # Personas replicate over the same links as messages. Optional so a test
+        # or a caller that only wants message anti-entropy can leave them out.
+        self.registry = registry if registry is not None else PersonaRegistry(store)
+        self.commands = commands
         self.destination: RNS.Destination | None = None
         self._inbound_links: dict[bytes, RNS.Link] = {}
         self._stop = threading.Event()
@@ -100,6 +129,7 @@ class FederationEngine:
             (PATH_BUCKET, self._serve_bucket),
             (PATH_FETCH, self._serve_fetch),
             (PATH_STATE, self._serve_state),
+            (PATH_PERSONAS, self._serve_personas),
         ):
             self.destination.register_request_handler(
                 path, response_generator=handler, allow=RNS.Destination.ALLOW_ALL
@@ -248,6 +278,32 @@ class FederationEngine:
             ]
         return [PROTOCOL_VERSION, self.config.hub_name, groups, members]
 
+    def _serve_personas(self, path, data, request_id, remote_identity, requested_at):
+        """Hand a peer every persona and device row this hub knows.
+
+        The full set every round, rather than a delta: a name is a single small
+        row, and full state means a hub that was down for a week converges on its
+        first round instead of needing a changelog nobody kept.
+        """
+        if not self._peer_allowed(remote_identity):
+            return None
+        personas, identities = self.registry.snapshot()
+        if (
+            len(personas) > MAX_PERSONAS_PER_RESPONSE
+            or len(identities) > MAX_IDENTITIES_PER_RESPONSE
+        ):
+            RNS.log(
+                f"Truncating persona state at {MAX_PERSONAS_PER_RESPONSE} persona(s) and"
+                f" {MAX_IDENTITIES_PER_RESPONSE} device(s): this hub holds"
+                f" {len(personas)} and {len(identities)}, so peers will not see all of them",
+                RNS.LOG_WARNING,
+            )
+        return [
+            PROTOCOL_VERSION,
+            personas[:MAX_PERSONAS_PER_RESPONSE],
+            identities[:MAX_IDENTITIES_PER_RESPONSE],
+        ]
+
     def _push_resource(self, link: RNS.Link, payload: bytes) -> None:
         """Bulk state moves as a Resource, never as individual LXMF packets."""
         RNS.Resource(payload, link)
@@ -271,6 +327,7 @@ class FederationEngine:
         try:
             link.identify(self.identity)
             self._exchange_state(link, peer_hash)
+            self._exchange_personas(link, peer_hash)
             response = self._request(
                 link,
                 PATH_ROOTS,
@@ -344,6 +401,43 @@ class FederationEngine:
                 for group_id, hashes in members.items()
             },
         )
+
+    def _exchange_personas(self, link: RNS.Link, peer_hash: bytes) -> None:
+        """Merge a peer's personas. A failure here must not abort the sync.
+
+        Usernames are a convenience; messages are not. A peer running an older
+        build, or one that fails this request, still gets its messages
+        reconciled.
+        """
+        try:
+            response = self._request(link, PATH_PERSONAS, [PROTOCOL_VERSION])
+        except Exception as exception:
+            RNS.log(f"Could not read peer personas: {exception}", RNS.LOG_DEBUG)
+            return
+        if not response or response[0] != PROTOCOL_VERSION or len(response) != 3:
+            return
+        _version, personas, identities = response
+        try:
+            losers = self.registry.merge(
+                [_persona_from_wire(row) for row in personas],
+                [_identity_from_wire(row) for row in identities],
+            )
+        except Exception as exception:
+            RNS.log(
+                f"Merging personas from {RNS.prettyhexrep(peer_hash)} failed: {exception}",
+                RNS.LOG_WARNING,
+            )
+            return
+        for persona, lost_name in losers:
+            # The name is gone from under its owner, who is holding a client that
+            # will keep showing it until somebody says otherwise.
+            RNS.log(
+                f"Persona {persona.persona_id.hex()} lost the username '{lost_name}' to an"
+                f" earlier claim from {RNS.prettyhexrep(peer_hash)}",
+                RNS.LOG_NOTICE,
+            )
+            if self.commands is not None:
+                self.commands.notify_name_lost(persona.persona_id, lost_name)
 
     def _reconcile_group(
         self, link: RNS.Link, state: SyncState, group_id: str, remote_roots: dict[int, bytes]
@@ -505,6 +599,27 @@ class FederationEngine:
     def _tree(self, group_id: str, epoch: int) -> PrefixMerkleTree:
         hashes = self.store.epoch_hashes(group_id, epoch, self.config.federation.epoch_seconds)
         return PrefixMerkleTree(hashes, depth=self.config.federation.merkle_depth)
+
+
+def _persona_from_wire(row: Any) -> PersonaRecord:
+    persona_id, name, claimed_at, revision, updated_at = row
+    return PersonaRecord(
+        persona_id=bytes(persona_id),
+        name=None if name is None else str(name),
+        claimed_at=float(claimed_at),
+        revision=int(revision),
+        updated_at=float(updated_at),
+    )
+
+
+def _identity_from_wire(row: Any) -> PersonaIdentity:
+    user_hash, persona_id, added_at, removed_at = row
+    return PersonaIdentity(
+        user_hash=bytes(user_hash),
+        persona_id=bytes(persona_id),
+        added_at=float(added_at),
+        removed_at=None if removed_at is None else float(removed_at),
+    )
 
 
 def _unpack_request(data: Any, arity: int) -> tuple[Any, ...]:

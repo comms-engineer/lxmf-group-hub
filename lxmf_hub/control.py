@@ -151,17 +151,7 @@ class ControlChannel:
 
     def help(self, verb: str | None = None) -> str:
         """Usage text taken from the parser, so it cannot drift from the verbs."""
-        if verb is not None and verb.lower() in REMOTE_COMMANDS:
-            return build_parser().subcommands[verb.lower()].format_help().strip()
-
-        parser = build_parser()
-        lines = ["Commands:"]
-        for name in sorted(REMOTE_COMMANDS):
-            lines.append(f"  {command_usage(name)}")
-            lines.append(f"      {parser.summaries[name]}")
-        lines.append("Send 'help <command>' for one command in detail.")
-        lines.append("Hashes may be pasted as <a1b2..>, a1:b2:.. or plain hex.")
-        return "\n".join(lines)
+        return operator_help(verb)
 
     # -- outbound --------------------------------------------------------
 
@@ -196,6 +186,25 @@ class ControlChannel:
             content=body.encode("utf-8"),
             title=b"",
         )
+
+
+def operator_help(verb: str | None = None) -> str:
+    """Operator usage text, taken from the parser so it cannot drift.
+
+    Module level because an operator also asks for it with ``/help`` inside a
+    group, where there is no control channel instance to ask.
+    """
+    if verb is not None and verb.lower() in REMOTE_COMMANDS:
+        return build_parser().subcommands[verb.lower()].format_help().strip()
+
+    parser = build_parser()
+    lines = ["Commands:"]
+    for name in sorted(REMOTE_COMMANDS):
+        lines.append(f"  {command_usage(name)}")
+        lines.append(f"      {parser.summaries[name]}")
+    lines.append("Send 'help <command>' for one command in detail.")
+    lines.append("Hashes may be pasted as <a1b2..>, a1:b2:.. or plain hex.")
+    return "\n".join(lines)
 
 
 def _normalise(command: str) -> str:

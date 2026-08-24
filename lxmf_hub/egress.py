@@ -26,6 +26,7 @@ from .store import (
     EgressItem,
     NoticeItem,
     Store,
+    UserItem,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
@@ -34,6 +35,7 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checke
 KIND_EGRESS = "egress"
 KIND_NOTICE = "notice"
 KIND_CONTROL = "control"
+KIND_USER = "user"
 
 
 class TokenBucket:
@@ -144,10 +146,19 @@ class EgressScheduler:
                 return 0.5
             self.send_control(reply)
 
+        answers = self.store.due_user(self.config.egress.batch_size)
         notices = self.store.due_notices(self.config.egress.batch_size)
         items = self.store.due_egress(self.config.egress.batch_size)
-        if not notices and not items:
+        if not answers and not notices and not items:
             return 0.5 if replies else 2.0
+
+        for answer in answers:
+            if self._stop.is_set():
+                return 0.5
+            if not self.bucket.consume():
+                return max(0.5, self.bucket.time_until())
+            if not self.send_user(answer):
+                self.bucket.refund()
 
         for notice in notices:
             if self._stop.is_set():
@@ -329,6 +340,62 @@ class EgressScheduler:
             )
         return True
 
+    def send_user(self, answer: UserItem) -> bool:
+        """Send one answer to a member's command. Returns whether it went on air.
+
+        Paced with client tokens rather than jumping the queue like an operator
+        answer: a member asking for status is not more urgent than the messages
+        the group is waiting on, and a hub with many members could otherwise be
+        made to spend all of its airtime answering questions.
+        """
+        if self._in_flight(KIND_USER, answer.item_id):
+            return False
+
+        if answer.attempts >= self.config.egress.max_attempts:
+            RNS.log(
+                f"Giving up on the answer to {RNS.prettyhexrep(answer.recipient_hash)}"
+                f" after {answer.attempts} attempts",
+                RNS.LOG_WARNING,
+            )
+            self.store.complete_user(answer.item_id)
+            return False
+
+        if self.destinations.destination_for(answer.group_id) is None:
+            self.store.defer_user(
+                answer.item_id, self.config.egress.retry_backoff_sec, count_attempt=False
+            )
+            return False
+
+        identity = RNS.Identity.recall(answer.recipient_hash)
+        if identity is None:
+            if not RNS.Transport.has_path(answer.recipient_hash):
+                RNS.Transport.request_path(answer.recipient_hash)
+            self.store.defer_user(answer.item_id, self._grace(answer.graces), count_attempt=False)
+            return True
+
+        try:
+            message = self.hub.build_notice(answer.group_id, identity, answer.body)
+        except Exception as exception:
+            RNS.log(f"Could not build the answer: {exception}", RNS.LOG_ERROR)
+            self.store.defer_user(answer.item_id, self._backoff(answer.attempts))
+            return False
+
+        message.desired_method = self._desired_method()
+        message.register_delivery_callback(lambda _message: self._user_done(answer, True))
+        message.register_failed_callback(lambda _message: self._user_done(answer, False))
+        self.store.defer_user(answer.item_id, self._backoff(answer.attempts))
+        self._mark_in_flight(KIND_USER, answer.item_id, message)
+        try:
+            self.router.handle_outbound(message)
+        except Exception as exception:
+            self._release(KIND_USER, answer.item_id)
+            RNS.log(
+                f"Outbound handling failed for the answer to"
+                f" {RNS.prettyhexrep(answer.recipient_hash)}: {exception}",
+                RNS.LOG_ERROR,
+            )
+        return True
+
     def send_control(self, reply: ControlItem) -> None:
         """Send one queued answer to an operator command."""
         if self._in_flight(KIND_CONTROL, reply.item_id):
@@ -432,6 +499,11 @@ class EgressScheduler:
             self._release(KIND_NOTICE, notice.item_id)
 
         return callback
+
+    def _user_done(self, answer: UserItem, delivered: bool) -> None:
+        self._release(KIND_USER, answer.item_id)
+        if delivered:
+            self.store.complete_user(answer.item_id)
 
     def _control_done(self, reply: ControlItem, delivered: bool) -> None:
         self._release(KIND_CONTROL, reply.item_id)

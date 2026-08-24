@@ -63,6 +63,7 @@ class FakeLink:
             "/fed/bucket": self.server._serve_bucket,
             "/fed/fetch": self.server._serve_fetch,
             "/fed/state": self.server._serve_state,
+            "/fed/personas": self.server._serve_personas,
         }[path]
         arguments = [path, roundtrip(data), b"request", self.remote_identity, 0.0]
         if path == "/fed/fetch":
@@ -152,7 +153,7 @@ def test_identical_hubs_transfer_nothing(pair):
         seed(store, 5)
 
     assert local.sync_peer(PEER_B) == 0
-    assert local.link_to_peer.requests == ["/fed/state", "/fed/roots"]
+    assert local.link_to_peer.requests == ["/fed/state", "/fed/personas", "/fed/roots"]
 
 
 def test_missing_messages_are_fetched_as_a_resource(pair):

@@ -25,7 +25,9 @@ from .egress import EgressScheduler
 from .failover import FailoverEngine
 from .federation import FederationEngine
 from .hub import GroupHub
+from .personas import PersonaRegistry
 from .store import Store
+from .usercmds import UserCommands
 
 GROUP_RELOAD_INTERVAL = 30.0
 PRUNE_INTERVAL = 3600.0
@@ -66,6 +68,8 @@ class HubDaemon:
         self.store: Store | None = None
         self.router: LXMF.LXMRouter | None = None
         self.hub: GroupHub | None = None
+        self.registry: PersonaRegistry | None = None
+        self.commands: UserCommands | None = None
         self.destinations: VirtualDestinationManager | None = None
         self.egress: EgressScheduler | None = None
         self.federation: FederationEngine | None = None
@@ -96,7 +100,13 @@ class HubDaemon:
         os.makedirs(self.router.ratchetpath, exist_ok=True)
 
         self.destinations = VirtualDestinationManager(self.router, self.store, self.config)
-        self.hub = GroupHub(self.config, self.store, self.router, self.destinations)
+        self.registry = PersonaRegistry(self.store)
+        self.commands = UserCommands(
+            self.config, self.store, self.registry, self.destinations
+        )
+        self.hub = GroupHub(
+            self.config, self.store, self.router, self.destinations, self.commands
+        )
         self.router.register_delivery_callback(self.deliver)
 
         # Before load_groups: LXMRouter.register_delivery_identity refuses to run
@@ -128,7 +138,9 @@ class HubDaemon:
         self.egress.start()
 
         if self.config.federation.enabled:
-            self.federation = FederationEngine(self.config, self.store, self.hub, identity)
+            self.federation = FederationEngine(
+                self.config, self.store, self.hub, identity, self.registry, self.commands
+            )
             self.federation.start()
             self.federation.announce()
             if self.config.failover.enabled:
@@ -203,6 +215,9 @@ class HubDaemon:
         pruned = self.hub.prune()
         if pruned:
             RNS.log(f"Pruned {pruned} expired message(s)", RNS.LOG_NOTICE)
+        # Spent and expired device codes are dead weight and, kept around, a
+        # window for guessing one.
+        self.store.prune_link_codes()
 
     def _signal(self, signum, frame) -> None:
         RNS.log("Shutting down hub", RNS.LOG_NOTICE)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import LXMF
 import msgpack
@@ -30,10 +30,14 @@ from .store import (
     message_hash,
 )
 
+if TYPE_CHECKING:  # The command channel reads liveness, which reads the hub.
+    from .usercmds import UserCommands
+
 # Keys inside the author metadata dict carried on reflected messages.
 META_AUTHOR = "author"
 META_GROUP = "group"
 META_HUB = "hub"
+META_NAME = "name"
 
 
 def pack_payload(timestamp: float, title: bytes, content: bytes, fields: dict[int, Any]) -> bytes:
@@ -46,6 +50,12 @@ def unpack_payload(payload: bytes) -> tuple[float, bytes, bytes, dict[int, Any]]
     return timestamp, title, content, fields or {}
 
 
+def _message_text(content: bytes | str | None) -> str:
+    if isinstance(content, bytes):
+        return content.decode("utf-8", "replace")
+    return content or ""
+
+
 class GroupHub:
     def __init__(
         self,
@@ -53,11 +63,15 @@ class GroupHub:
         store: Store,
         router: LXMF.LXMRouter,
         destinations: VirtualDestinationManager,
+        commands: UserCommands | None = None,
     ):
         self.config = config
         self.store = store
         self.router = router
         self.destinations = destinations
+        # Optional so a hub can be constructed without the command channel;
+        # the daemon always wires one in.
+        self.commands = commands
 
     # -- group administration --------------------------------------------
 
@@ -102,6 +116,19 @@ class GroupHub:
             return
 
         if not self.authorise(group, message.source_hash):
+            return
+
+        # A command is answered instead of being reflected, so the group does not
+        # see one member's '/status'. Only the known verbs are taken: anything
+        # else beginning with a slash is a message and is posted as one.
+        if self.commands is not None and self.commands.handle(
+            group_id, message.source_hash, _message_text(message.content)
+        ):
+            RNS.log(
+                f"Answered command from {RNS.prettyhexrep(message.source_hash)}"
+                f" in group '{group_id}'",
+                RNS.LOG_INFO,
+            )
             return
 
         payload = pack_payload(
@@ -245,13 +272,18 @@ class GroupHub:
         """Title, content and fields of a reflection, with author attribution."""
         _timestamp, title, content, fields = unpack_payload(record.payload)
         fields = dict(fields)
+        # A username where the author has claimed one: a federated persona name
+        # is more use to a reader than a hash, and the hash stays in the metadata
+        # for anything that wants to match on identity rather than display it.
+        name = self.store.display_name_for(record.sender_hash)
         fields[self.config.author_field] = {
             META_AUTHOR: record.sender_hash,
             META_GROUP: record.group_id,
             META_HUB: hub_hash,
+            META_NAME: name,
         }
         if self.config.author_prefix_in_content:
-            author = RNS.prettyhexrep(record.sender_hash)
+            author = name if name else RNS.prettyhexrep(record.sender_hash)
             content = f"{author}: ".encode() + content
         return title, content, fields
 
