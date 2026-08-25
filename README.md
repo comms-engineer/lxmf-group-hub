@@ -341,6 +341,15 @@ Hub b joins the federation with `--port 4243 --connect 4242 --peer <hub_a_federa
 
 Personas and commands add: claiming, renaming and case-folded uniqueness, multi-device linking with one-time and expired codes, unlink tombstones surviving a federation round, deterministic convergence of two conflicting claims across two merge rounds, persona-name attribution alongside the author hash, known verbs consumed while a slash-prefixed message is reflected, a banned sender getting no answer, durable answers across a failed delivery, and opening a database written before the persona tables existed.
 
+## To-Do
+- Operators should automatically join a group they complete with their operator identity. If they don't want to, have the option to set a flag (--no-join?).
+- Look into stamp settings to balance efficiency and anti-spam/DoS
+- An authorized user using the /link function to associate another identity to their username shouldn't have to have the identity manually added by the operator, it should be automatic.
+- Look into a way to make creation of member identities for multiple groups faster. Maybe copying usernames/associated identities as specified by the operator?
+- Names of groups should probably be private, only visible to members. All others should just see the identity.
+- Create a method of generating and sharing a key that allows identities to join a group without operator involvement.
+- Verify that usernames are hub-wide, not per-group
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
