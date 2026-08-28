@@ -29,6 +29,7 @@ without a restart.
 from __future__ import annotations
 
 import shlex
+import threading
 import time
 
 import LXMF
@@ -36,6 +37,7 @@ import RNS
 
 from .admin import CommandError, administer, build_parser, command_usage
 from .config import HubConfig
+from .hub import _UnverifiedEntry
 from .store import Store
 
 # Verbs an operator may drive remotely. "run" is deliberately absent: starting a
@@ -73,6 +75,11 @@ class ControlChannel:
         self.operators = config.operator_hashes
         self.destination: RNS.Destination | None = None
         self._next_announce = 0.0
+        # Operator commands held because RNS had not yet cached the sender's
+        # identity, typically right after a restart. Mirrors GroupHub's
+        # unverified hold so an operator does not have to re-advert by hand.
+        self._unverified: list[_UnverifiedEntry] = []
+        self._unverified_lock = threading.Lock()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -106,8 +113,20 @@ class ControlChannel:
     # -- inbound ---------------------------------------------------------
 
     def handle(self, message: LXMF.LXMessage) -> None:
+        # Identity and authorisation rest solely on the Ed25519 signature that
+        # RNS already verified while unpacking the message. That verification
+        # needs the sender's identity cached locally, which a hub that just
+        # restarted may not have yet -- so an unresolved identity is held and
+        # retried instead of dropped outright; anything else unverified (a bad
+        # signature) is dropped, since retrying it would never change the result.
         if not message.signature_validated:
-            RNS.log("Dropping unverified message on the control destination", RNS.LOG_NOTICE)
+            if (
+                getattr(message, "unverified_reason", None) == LXMF.LXMessage.SOURCE_UNKNOWN
+                and getattr(message, "packed", None)
+            ):
+                self._hold_unverified(message)
+            else:
+                RNS.log("Dropping unverified message on the control destination", RNS.LOG_NOTICE)
             return
         if message.source_hash not in self.operators:
             RNS.log(
@@ -170,6 +189,78 @@ class ControlChannel:
     def help(self, verb: str | None = None) -> str:
         """Usage text taken from the parser, so it cannot drift from the verbs."""
         return operator_help(verb)
+
+    # -- unverified retry --------------------------------------------------
+
+    def _hold_unverified(self, message: LXMF.LXMessage) -> None:
+        """Park a control message whose sender identity RNS has not cached yet.
+
+        See ``GroupHub._hold_unverified``: the path request nudges the operator's
+        client to (re-)announce, which is what lets the hub recognise them again
+        after a restart without them having to advert by hand.
+        """
+        RNS.log(
+            f"Identity for {RNS.prettyhexrep(message.source_hash)} not yet cached,"
+            " holding control message and requesting a path",
+            RNS.LOG_NOTICE,
+        )
+        if not RNS.Transport.has_path(message.source_hash):
+            RNS.Transport.request_path(message.source_hash)
+        now = time.time()
+        entry = _UnverifiedEntry(
+            packed=message.packed,
+            source_hash=message.source_hash,
+            deadline=now + self.config.egress.unverified_hold_sec,
+            next_request=now + self.config.egress.path_request_grace_sec,
+        )
+        with self._unverified_lock:
+            self._unverified.append(entry)
+
+    def retry_unverified(self) -> None:
+        """Re-validate held control messages, replaying any whose identity resolved."""
+        with self._unverified_lock:
+            if not self._unverified:
+                return
+            pending, self._unverified = self._unverified, []
+
+        now = time.time()
+        still_pending: list[_UnverifiedEntry] = []
+        for entry in pending:
+            if now >= entry.deadline:
+                RNS.log(
+                    f"Giving up on held control message from"
+                    f" {RNS.prettyhexrep(entry.source_hash)}: identity never resolved",
+                    RNS.LOG_WARNING,
+                )
+                continue
+
+            if RNS.Identity.recall(entry.source_hash) is None:
+                if now >= entry.next_request:
+                    if not RNS.Transport.has_path(entry.source_hash):
+                        RNS.Transport.request_path(entry.source_hash)
+                    entry.next_request = now + self.config.egress.path_request_grace_sec
+                still_pending.append(entry)
+                continue
+
+            message = LXMF.LXMessage.unpack_from_bytes(entry.packed)
+            if message.signature_validated:
+                RNS.log(
+                    f"Identity for {RNS.prettyhexrep(entry.source_hash)} resolved,"
+                    " replaying held control message",
+                    RNS.LOG_NOTICE,
+                )
+                self.handle(message)
+            else:
+                RNS.log(
+                    f"Held control message from {RNS.prettyhexrep(entry.source_hash)} still"
+                    " fails signature validation now that its identity is known,"
+                    " dropping",
+                    RNS.LOG_NOTICE,
+                )
+
+        if still_pending:
+            with self._unverified_lock:
+                self._unverified.extend(still_pending)
 
     # -- outbound --------------------------------------------------------
 

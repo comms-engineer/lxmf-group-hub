@@ -144,6 +144,8 @@ class EgressScheduler:
         cannot dump 40 messages onto an RF interface at once.
         """
         self.hub.retry_unverified()
+        if self.control is not None:
+            self.control.retry_unverified()
 
         replies = self.store.due_control(self.config.egress.batch_size)
         for reply in replies:

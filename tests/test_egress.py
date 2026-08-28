@@ -492,6 +492,9 @@ class StubControl:
         self.built.append(body)
         return message
 
+    def retry_unverified(self):
+        pass
+
 
 def _stub_message():
     return StubMessage()
