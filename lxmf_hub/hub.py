@@ -8,8 +8,10 @@ the reflected message, so threads keep their context on the client side.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import LXMF
@@ -56,6 +58,21 @@ def _message_text(content: bytes | str | None) -> str:
     return content or ""
 
 
+@dataclass
+class _UnverifiedEntry:
+    """A message held because its sender's identity was not yet cached.
+
+    Its raw bytes are kept rather than the ``LXMessage``: signature validation
+    happens once, during unpacking, so re-validating later means unpacking
+    again from scratch, not re-checking the object already given up on.
+    """
+
+    packed: bytes
+    source_hash: bytes
+    deadline: float
+    next_request: float = 0.0
+
+
 class GroupHub:
     def __init__(
         self,
@@ -72,6 +89,12 @@ class GroupHub:
         # Optional so a hub can be constructed without the command channel;
         # the daemon always wires one in.
         self.commands = commands
+        # Messages held because RNS had not yet cached the sender's identity --
+        # typically right after a restart, before the hub has heard any fresh
+        # announces of its own. Retried from EgressScheduler.tick() rather than
+        # a dedicated thread, since that loop already runs every 0.5-2s.
+        self._unverified: list[_UnverifiedEntry] = []
+        self._unverified_lock = threading.Lock()
 
     # -- group administration --------------------------------------------
 
@@ -106,13 +129,23 @@ class GroupHub:
             return
 
         # Identity and authorisation rest solely on the Ed25519 signature that
-        # RNS already verified while unpacking the message.
+        # RNS already verified while unpacking the message. That verification
+        # needs the sender's identity cached locally, which a hub that just
+        # restarted may not have yet -- so an unresolved identity is held and
+        # retried instead of dropped outright; anything else unverified (a bad
+        # signature) is dropped, since retrying it would never change the result.
         if not message.signature_validated:
-            RNS.log(
-                f"Dropping unverified LXM for group '{group_id}' from "
-                f"{RNS.prettyhexrep(message.source_hash)}",
-                RNS.LOG_NOTICE,
-            )
+            if (
+                getattr(message, "unverified_reason", None) == LXMF.LXMessage.SOURCE_UNKNOWN
+                and getattr(message, "packed", None)
+            ):
+                self._hold_unverified(group_id, message)
+            else:
+                RNS.log(
+                    f"Dropping unverified LXM for group '{group_id}' from "
+                    f"{RNS.prettyhexrep(message.source_hash)}",
+                    RNS.LOG_NOTICE,
+                )
             return
 
         if not self.authorise(group, message.source_hash):
@@ -191,6 +224,85 @@ class GroupHub:
         clean = dict(fields or {})
         clean.pop(self.config.author_field, None)
         return clean
+
+    # -- unverified retry --------------------------------------------------
+
+    def _hold_unverified(self, group_id: str, message: LXMF.LXMessage) -> None:
+        """Park a message whose sender identity RNS has not cached yet.
+
+        A path request nudges the sender to (re-)announce, which is what lets
+        the identity resolve without the sender doing anything itself; without
+        it, the hub would only ever learn the identity on the sender's own
+        announce schedule, which can be much longer than a client is willing to
+        wait after one silently dropped message.
+        """
+        RNS.log(
+            f"Identity for {RNS.prettyhexrep(message.source_hash)} not yet cached,"
+            f" holding message for group '{group_id}' and requesting a path",
+            RNS.LOG_NOTICE,
+        )
+        if not RNS.Transport.has_path(message.source_hash):
+            RNS.Transport.request_path(message.source_hash)
+        now = time.time()
+        entry = _UnverifiedEntry(
+            packed=message.packed,
+            source_hash=message.source_hash,
+            deadline=now + self.config.egress.unverified_hold_sec,
+            next_request=now + self.config.egress.path_request_grace_sec,
+        )
+        with self._unverified_lock:
+            self._unverified.append(entry)
+
+    def retry_unverified(self) -> None:
+        """Re-validate held messages, replaying any whose identity resolved.
+
+        Meant to be called from a frequent, already-existing tick (the egress
+        scheduler's) rather than run its own thread: held messages are rare and
+        short-lived, so a second polling loop would be pure overhead.
+        """
+        with self._unverified_lock:
+            if not self._unverified:
+                return
+            pending, self._unverified = self._unverified, []
+
+        now = time.time()
+        still_pending: list[_UnverifiedEntry] = []
+        for entry in pending:
+            if now >= entry.deadline:
+                RNS.log(
+                    f"Giving up on held message from {RNS.prettyhexrep(entry.source_hash)}:"
+                    " identity never resolved",
+                    RNS.LOG_WARNING,
+                )
+                continue
+
+            if RNS.Identity.recall(entry.source_hash) is None:
+                if now >= entry.next_request:
+                    if not RNS.Transport.has_path(entry.source_hash):
+                        RNS.Transport.request_path(entry.source_hash)
+                    entry.next_request = now + self.config.egress.path_request_grace_sec
+                still_pending.append(entry)
+                continue
+
+            message = LXMF.LXMessage.unpack_from_bytes(entry.packed)
+            if message.signature_validated:
+                RNS.log(
+                    f"Identity for {RNS.prettyhexrep(entry.source_hash)} resolved,"
+                    " replaying held message",
+                    RNS.LOG_NOTICE,
+                )
+                self.handle_inbound(message)
+            else:
+                RNS.log(
+                    f"Held message from {RNS.prettyhexrep(entry.source_hash)} still"
+                    " fails signature validation now that its identity is known,"
+                    " dropping",
+                    RNS.LOG_NOTICE,
+                )
+
+        if still_pending:
+            with self._unverified_lock:
+                self._unverified.extend(still_pending)
 
     # -- federation ingest -----------------------------------------------
 

@@ -143,6 +143,8 @@ class EgressScheduler:
         They spend the same tokens as reflections, so an adoption of 40 members
         cannot dump 40 messages onto an RF interface at once.
         """
+        self.hub.retry_unverified()
+
         replies = self.store.due_control(self.config.egress.batch_size)
         for reply in replies:
             if self._stop.is_set():

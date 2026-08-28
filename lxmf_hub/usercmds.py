@@ -46,7 +46,7 @@ USAGE = (
     (VERB_HELP, "this list"),
     (VERB_STATUS, "groups, hubs, queues and who you are"),
     (f"{VERB_NAME} <username>", "claim or change your username"),
-    (VERB_WHOAMI, "your username and linked devices"),
+    (VERB_WHOAMI, "your username, devices, and the LXMF address to give an admin"),
     (VERB_LINK, "get a one-time code to add another device"),
     (f"{VERB_LINK} <code>", "join this device to that persona"),
     (f"{VERB_UNLINK} <hash>", "drop one of your own devices"),
@@ -205,15 +205,21 @@ class UserCommands:
         )
 
     def _identity_line(self, sender_hash: bytes) -> str:
+        """Show the member their own LXMF address.
+
+        This is the value an operator needs for add-member -- the delivery
+        destination hash the hub checks messages against -- not the RNS
+        identity hash a client may show elsewhere under a similar name.
+        """
         persona = self.registry.persona_for(sender_hash)
         if persona is None:
             return (
-                f"you: {sender_hash.hex()}, no username yet"
+                f"your LXMF address: {sender_hash.hex()}, no username yet"
                 f" -- send '{VERB_NAME} <username>' to claim one"
             )
         devices = self.registry.devices(persona.persona_id)
         name = persona.name or "no username yet"
-        return f"you: {name}, {len(devices)} device(s), posting from {sender_hash.hex()}"
+        return f"you: {name}, {len(devices)} device(s), your LXMF address: {sender_hash.hex()}"
 
     def _group_lines(self, now: float) -> list[str]:
         lines = []
@@ -311,14 +317,20 @@ class UserCommands:
         )
 
     def _whoami(self, sender_hash: bytes) -> str:
+        """List the member's persona and devices by their LXMF address.
+
+        Each hash below is what an operator needs for add-member: the delivery
+        destination hash the hub authorises against, not an RNS identity hash.
+        """
         persona = self.registry.persona_for(sender_hash)
         if persona is None:
             return (
-                f"{sender_hash.hex()} has no persona."
+                f"your LXMF address: {sender_hash.hex()}, no persona yet."
                 f" Send '{VERB_NAME} <username>' to claim a username."
             )
         lines = [
             f"{persona.name or 'no username yet'} (persona {persona.persona_id.hex()})",
+            "your device(s), by LXMF address:",
         ]
         for device in self.registry.devices(persona.persona_id):
             marker = " <- this device" if device.user_hash == sender_hash else ""

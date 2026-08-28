@@ -135,14 +135,24 @@ class PersonaRegistry:
         return code, expires_at
 
     def join(self, user_hash: bytes, code: str) -> PersonaRecord:
-        """Attach a device to the persona a code was minted for."""
+        """Attach a device to the persona a code was minted for.
+
+        The new device inherits whatever group membership its persona already
+        has, so linking a device is enough to authorise it in an invite-only
+        group -- an operator does not have to add-member a hash that is already,
+        transitively, a member through another of the same person's devices.
+        """
         persona_id = self.store.claim_link_code(code.strip().upper())
         if persona_id is None:
             raise PersonaError("That code is not valid. Codes are single-use and expire.")
         persona = self.store.get_persona(persona_id)
         if persona is None:
             raise PersonaError("The persona that code belonged to is gone.")
+        existing = [device.user_hash for device in self.store.persona_devices(persona_id)]
+        roles = self.store.memberships_for(existing)
         self.store.link_identity(persona_id, user_hash)
+        for group_id, role in roles.items():
+            self.store.add_member(group_id, user_hash, role)
         return persona
 
     def unlink(self, user_hash: bytes, target_hash: bytes) -> PersonaRecord:

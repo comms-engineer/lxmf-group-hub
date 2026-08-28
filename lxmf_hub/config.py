@@ -25,6 +25,12 @@ class EgressConfig:
     propagation_node: str | None = None
     stamp_cost: int | None = None
     path_request_grace_sec: float = 15.0
+    # How long an inbound message may be held waiting for its sender's identity
+    # to resolve (see GroupHub._hold_unverified), before it is given up on. Long
+    # enough for a path request to reach a sender over a slow RF hop and for it
+    # to answer with an announce, short enough that a sender who is simply gone
+    # does not tie up memory indefinitely.
+    unverified_hold_sec: float = 120.0
     # How long a message handed to LXMF may be in flight before the scheduler
     # assumes neither callback is coming and offers the queue row again. LXMF
     # retries a delivery of its own accord (five attempts, ten seconds apart,
@@ -129,8 +135,10 @@ class HubConfig:
     author_field: int = 0xFD
     author_prefix_in_content: bool = True
     log_level: int = 4
-    # LXMF destination hash, or list of hashes, allowed to administer this hub
-    # over LXMF. Empty means the control destination is never brought up.
+    # LXMF address (delivery destination hash), or list of them, allowed to
+    # administer this hub over LXMF. Empty means the control destination is
+    # never brought up. This is the same kind of value add-member wants, not an
+    # RNS identity hash: get it from the operator's own '/whoami' or '/status'.
     operator_identity: str | list[str] | None = None
     at_rest: AtRestConfig = field(default_factory=AtRestConfig)
     egress: EgressConfig = field(default_factory=EgressConfig)
