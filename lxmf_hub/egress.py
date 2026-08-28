@@ -28,6 +28,7 @@ from .store import (
     Store,
     UserItem,
 )
+from .tickets import ScopedTickets
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
     from .control import ControlChannel
@@ -86,6 +87,7 @@ class EgressScheduler:
         hub: GroupHub,
         router: LXMF.LXMRouter,
         destinations: VirtualDestinationManager,
+        tickets: ScopedTickets,
         directory: DirectoryChannel | None = None,
         control: ControlChannel | None = None,
     ):
@@ -94,6 +96,7 @@ class EgressScheduler:
         self.hub = hub
         self.router = router
         self.destinations = destinations
+        self.tickets = tickets
         self.directory = directory
         self.control = control
         self.bucket = TokenBucket(config.egress.tokens_per_second, config.egress.burst)
@@ -279,6 +282,7 @@ class EgressScheduler:
         # still queued and simply retried after the backoff.
         self.store.defer_egress(item.item_id, self._backoff(item.attempts))
         self._mark_in_flight(KIND_EGRESS, item.item_id, message)
+        self.tickets.seed(self.router, message)
         try:
             self.router.handle_outbound(message)
         except Exception as exception:
@@ -339,6 +343,7 @@ class EgressScheduler:
         message.register_failed_callback(self._notice_failed(notice))
         self.store.defer_notice(notice.item_id, self._backoff(notice.attempts))
         self._mark_in_flight(KIND_NOTICE, notice.item_id, message)
+        self.tickets.seed(self.router, message)
         try:
             self.router.handle_outbound(message)
         except Exception as exception:
@@ -395,6 +400,7 @@ class EgressScheduler:
         message.register_failed_callback(lambda _message: self._user_done(answer, False))
         self.store.defer_user(answer.item_id, self._backoff(answer.attempts))
         self._mark_in_flight(KIND_USER, answer.item_id, message)
+        self.tickets.seed(self.router, message)
         try:
             self.router.handle_outbound(message)
         except Exception as exception:
@@ -441,7 +447,7 @@ class EgressScheduler:
             self.store.defer_control(reply.item_id, self._backoff(reply.attempts))
             return
 
-        message.desired_method = self._desired_method()
+        message.desired_method = self._control_method(reply)
         message.register_delivery_callback(
             lambda _message: self._control_done(reply, delivered=True)
         )
@@ -450,6 +456,7 @@ class EgressScheduler:
         )
         self.store.defer_control(reply.item_id, self._backoff(reply.attempts))
         self._mark_in_flight(KIND_CONTROL, reply.item_id, message)
+        self.tickets.seed(self.router, message)
         try:
             self.router.handle_outbound(message)
         except Exception as exception:
@@ -471,6 +478,16 @@ class EgressScheduler:
         if self.config.egress.prefer_propagation and self.router.get_outbound_propagation_node():
             return LXMF.LXMessage.PROPAGATED
         return LXMF.LXMessage.DIRECT
+
+    def _control_method(self, reply: ControlItem) -> int:
+        """Operator replies try a direct link first, regardless of the
+        propagation preference, and only fall back once that attempt has
+        failed -- direct delivery needs no PN round trip and is preferable
+        whenever the operator is actually reachable.
+        """
+        if reply.attempts == 0 and self.router.get_outbound_propagation_node():
+            return LXMF.LXMessage.DIRECT
+        return self._desired_method()
 
     def _delivered(self, item: EgressItem):
         def callback(message: LXMF.LXMessage) -> None:
