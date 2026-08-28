@@ -32,6 +32,12 @@ lxmf-hub --config hub.json add-member ops <client_lxmf_destination_hash>
 lxmf-hub --config hub.json run
 ```
 
+When `--name` is omitted, the hub assigns the group a unique public codename
+from its built-in operations-style alias pool. This is the name stock clients
+may show before a member gives the contact a local alias. The selected alias is
+stored in the hub database, and database files are ignored by git; the alias
+pool itself is versioned in `lxmf_hub/aliases.py`.
+
 `create-group` prints three tab-separated columns: the group id, the ACL mode, and the destination hash. That hash is what a member pastes into Sideband as a contact.
 
 **`<client_lxmf_destination_hash>` must be the member's LXMF address, not their RNS identity hash.** These are two different values a client derives from the same identity, and clients are inconsistent about which one they surface as "address," "identity hash," or "destination hash" in their UI. The hub authorises every inbound message against `message.source_hash`, which is the LXMF delivery destination hash -- the address a client would message the group *from*. An RNS identity hash added by mistake is stored but never matches anything, so the member it was meant to add stays unauthorised with no error to explain why.

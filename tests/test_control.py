@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from lxmf_hub.aliases import PUBLIC_ALIASES
 from lxmf_hub.config import HubConfig
 from lxmf_hub.control import MAX_COMMAND_BYTES, REMOTE_COMMANDS, ControlChannel
 from lxmf_hub.store import ROLE_BANNED, Store
@@ -65,12 +66,24 @@ def test_operators_can_create_a_group_and_add_a_member(tmp_path):
 
     created = channel.execute("create-group ops --acl public")
     assert created.startswith("ops\tpublic\t")
-    assert store.get_group("ops") is not None
+    assert store.get_group("ops").display_name in PUBLIC_ALIASES
 
     assert channel.execute(f"add-member ops {MEMBER}").endswith("in ops")
     assert store.get_role("ops", bytes.fromhex(MEMBER)) == "member"
 
     assert channel.execute("groups").startswith("ops\tpublic\t1 member(s)\t")
+
+
+def test_group_aliases_are_unique_and_explicit_names_remain_supported(tmp_path):
+    channel, store = make_channel(tmp_path)
+
+    channel.execute("create-group ops")
+    channel.execute("create-group weather")
+    channel.execute('create-group nets --name "Mission Nets"')
+
+    aliases = {group.display_name for group in store.list_groups()}
+    assert len(aliases) == 3
+    assert store.get_group("nets").display_name == "Mission Nets"
 
 
 def test_roles_and_acl_changes_go_through(tmp_path):

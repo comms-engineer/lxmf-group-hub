@@ -15,6 +15,7 @@ import time
 import LXMF
 import RNS
 
+from .aliases import choose_alias
 from .config import DESTINATION_HASH_LENGTH, HubConfig
 from .crypto import MODE_NONE
 from .destinations import group_destination_hash
@@ -93,7 +94,7 @@ def build_parser() -> TextParser:
 
     create = add_command("create-group", "create a group and its RNS identity")
     create.add_argument("group_id")
-    create.add_argument("--name", help="display name announced to clients")
+    create.add_argument("--name", help="explicit public alias; otherwise a codename is generated")
     create.add_argument("--acl", choices=[ACL_PUBLIC, ACL_INVITE], help="ACL mode")
 
     add_command("groups", "list groups and their destination hashes")
@@ -155,9 +156,10 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
         if store.get_group(args.group_id) is not None:
             raise CommandError(f"Group '{args.group_id}' already exists")
         identity = RNS.Identity()
+        used_aliases = {group.display_name for group in store.list_groups()}
         group = store.create_group(
             group_id=args.group_id,
-            display_name=args.name or args.group_id,
+            display_name=args.name or choose_alias(used_aliases),
             identity_key=identity.get_private_key(),
             acl_mode=args.acl or config.default_acl_mode,
         )
