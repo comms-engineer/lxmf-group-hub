@@ -143,7 +143,7 @@ def test_a_truncated_hash_is_refused_rather_than_stored(tmp_path):
 
     reply = channel.execute("add-member ops 3333")
 
-    assert "destination hash is 16" in reply
+    assert "delivery destination" in reply and "16" in reply
     assert store.list_members("ops", include_banned=True) == []
 
 
@@ -222,7 +222,7 @@ def test_bad_arguments_come_back_as_text_not_an_exit(tmp_path):
     channel, store = make_channel(tmp_path)
     assert "No such group" in channel.execute(f"add-member missing {MEMBER}")
     channel.execute("create-group ops")
-    assert "not a hex destination hash" in channel.execute("add-member ops zzzz")
+    assert "not a hex LXMF address" in channel.execute("add-member ops zzzz")
     assert "invalid choice" in channel.execute("set-acl ops sideways")
     assert channel.execute("create-group ops") == "Group 'ops' already exists"
     assert len(store.list_groups()) == 1

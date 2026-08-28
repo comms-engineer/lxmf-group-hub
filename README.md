@@ -34,9 +34,13 @@ lxmf-hub --config hub.json run
 
 `create-group` prints three tab-separated columns: the group id, the ACL mode, and the destination hash. That hash is what a member pastes into Sideband as a contact.
 
+**`<client_lxmf_destination_hash>` must be the member's LXMF address, not their RNS identity hash.** These are two different values a client derives from the same identity, and clients are inconsistent about which one they surface as "address," "identity hash," or "destination hash" in their UI. The hub authorises every inbound message against `message.source_hash`, which is the LXMF delivery destination hash -- the address a client would message the group *from*. An RNS identity hash added by mistake is stored but never matches anything, so the member it was meant to add stays unauthorised with no error to explain why.
+
+The hub itself cannot hand this value back before the member is added: in an `invite` group a non-member's messages, including a `/whoami`, are dropped before authorisation, and the operator control channel only answers senders already on its own fixed list. So collect it from the member's own client -- Sideband, NomadNet, and MeshChat all have a screen showing your own LXMF address/identity -- and only rely on the in-band `/whoami` or `/status` for someone already admitted to a `public` group or already a member elsewhere on this hub.
+
 Administration is out of band by design, because in-band commands would mean parsing text from unauthenticated senders. Groups, ACLs, and roles live in SQLite; `create-group`, `add-member`, `remove-member`, `set-acl`, `groups`, `members`, and `status` all operate on the database directly and are safe to run while the daemon is up. A running daemon rescans the `groups` table every 30 seconds and attaches anything new, so a group created at 14:02 is announcing by 14:03 without a restart.
 
-`status` prints the group count, the egress, notice, and operator answer queue depths, and, when `operator_identity` is set, the control destination hash operators address.
+`status` prints the group count, the egress, notice, and operator answer queue depths, and, when `operator_identity` is set, the control destination hash operators address. `operator_identity` itself takes the same kind of value as `add-member`: an operator's LXMF address, not their RNS identity hash.
 
 Destination hashes are accepted in the shapes clients and RNS actually print them: `<8f1c0d7a...>`, `8f:1c:0d:7a:...`, `0x8f1c...`, or plain hex. A hash of the wrong length is refused rather than stored, since `bytes.fromhex` accepts a truncated paste happily and a member nothing can ever match looks exactly like a member who is offline.
 
@@ -106,6 +110,8 @@ Unknown keys raise `ValueError` at load time instead of being ignored, so a typo
 ## Operator control over LXMF
 
 `operator_identity` takes an LXMF destination hash, or a list of them, and brings up a control destination on the hub identity. It's a separate destination from every group, so group traffic never carries commands and members never see an admin surface. Authorisation is the same Ed25519 signature check the group path uses, against a fixed list of hashes. No password, no token, no session.
+
+As with `add-member`, this is the operator's LXMF address (their own delivery destination hash), not their RNS identity hash. Get it from the operator's own client, or from `/whoami`/`/status` if they are already a member of a group on this hub -- the control destination itself won't answer them until `operator_identity` already contains their address.
 
 ```json
 { "operator_identity": ["8f1c0d7a4b2e6f9081c3d5a7b9e1f3c5"] }
@@ -274,6 +280,8 @@ A username belongs to a persona, not to a destination hash, because one person i
 Names are unique per federation, compared with `str.casefold()` and displayed as typed, so `Alice` and `alice` are one name and the capitalisation the owner chose survives. A device belongs to at most one persona at a time, and the last device of a named persona can't be unlinked, since a name nobody can post under is a name nobody can release either.
 
 Link codes never leave the hub that minted them. They are six characters from an alphabet with no `0/O` or `1/I`, single-use, and expire in 15 minutes; the second device proves nothing but possession of the code, which is the same trust model as pairing a device by reading a number off a screen.
+
+Linking a device also carries over whatever groups the persona already belongs to: the new device gets the same role (member or admin, never a ban) in every group where an existing device of that persona has one, so a member adding their laptop to an invite-only group they're already in doesn't need the operator to `add-member` it by hand. Membership on the linking device's own hash is untouched by this -- unlink drops the roles it was given the same way any member's departure would, via `remove-member`.
 
 Every sync round also runs `/fed/personas`, which returns the persona rows and the device rows, tombstones included. A tombstone is why an unlink sticks: a peer that still remembers the link would otherwise re-add the device on the next round, and "my old phone keeps posting as me" is not a bug a member can work around. Rows merge on `(revision, updated_at)`, and the exchange is wrapped so a peer that doesn't answer the path -- an older hub -- costs nothing but a log line while message reconciliation continues.
 

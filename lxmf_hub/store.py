@@ -547,6 +547,29 @@ class Store:
             rows = self._db.execute(query, params).fetchall()
         return [(row["user_hash"], row["role"]) for row in rows]
 
+    def memberships_for(self, user_hashes: list[bytes]) -> dict[str, str]:
+        """The best non-banned role held by any of the given devices, per group.
+
+        Used to carry a persona's group membership onto a device it just linked,
+        so joining a device is enough to authorise it -- an operator should not
+        have to add-member a hash that is already, transitively, a member.
+        """
+        if not user_hashes:
+            return {}
+        placeholders = ",".join("?" for _ in user_hashes)
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT group_id, role FROM members WHERE user_hash IN ({placeholders})"
+                " AND role != ?",
+                (*user_hashes, ROLE_BANNED),
+            ).fetchall()
+        roles: dict[str, str] = {}
+        for row in rows:
+            group_id, role = row["group_id"], row["role"]
+            if role == ROLE_ADMIN or group_id not in roles:
+                roles[group_id] = role
+        return roles
+
     # -- messages --------------------------------------------------------
 
     def has_message(self, msg_hash: bytes) -> bool:

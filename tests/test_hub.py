@@ -7,6 +7,9 @@ the reflection path can be exercised without a live Reticulum instance.
 
 from types import SimpleNamespace
 
+import LXMF
+import RNS
+
 from lxmf_hub.config import HubConfig
 from lxmf_hub.hub import META_AUTHOR, GroupHub, pack_payload, unpack_payload
 from lxmf_hub.personas import PersonaRegistry
@@ -104,6 +107,83 @@ def test_unsigned_messages_are_dropped(tmp_path):
     assert store.group_history(GROUP) == []
 
 
+def test_message_with_unknown_source_identity_is_held_not_dropped(tmp_path, monkeypatch):
+    """Right after a restart, RNS has not yet cached a sender's identity.
+
+    Such a message must be held and retried, not dropped outright: dropping it
+    is what forces clients to send a throwaway message or wait for their own
+    announce interval before a real message gets through.
+    """
+    hub, store = make_hub(tmp_path)
+    store.add_member(GROUP, ALICE)
+    store.add_member(GROUP, BOB)
+
+    requested = []
+    monkeypatch.setattr(RNS.Transport, "has_path", staticmethod(lambda _hash: False))
+    monkeypatch.setattr(
+        RNS.Transport, "request_path", staticmethod(lambda h: requested.append(h))
+    )
+
+    held = inbound(signed=False)
+    held.unverified_reason = LXMF.LXMessage.SOURCE_UNKNOWN
+    held.packed = b"raw-lxmf-bytes"
+
+    hub.handle_inbound(held)
+
+    assert store.group_history(GROUP) == []
+    assert requested == [ALICE]
+    assert len(hub._unverified) == 1
+
+
+def test_held_message_is_replayed_once_its_identity_resolves(tmp_path, monkeypatch):
+    hub, store = make_hub(tmp_path)
+    store.add_member(GROUP, ALICE)
+    store.add_member(GROUP, BOB)
+
+    monkeypatch.setattr(RNS.Transport, "has_path", staticmethod(lambda _hash: False))
+    monkeypatch.setattr(RNS.Transport, "request_path", staticmethod(lambda _hash: None))
+    monkeypatch.setattr(RNS.Identity, "recall", staticmethod(lambda _hash: None))
+
+    held = inbound(signed=False)
+    held.unverified_reason = LXMF.LXMessage.SOURCE_UNKNOWN
+    held.packed = b"raw-lxmf-bytes"
+    hub.handle_inbound(held)
+
+    # The identity resolves, and re-unpacking the held bytes now validates.
+    monkeypatch.setattr(RNS.Identity, "recall", staticmethod(lambda _hash: object()))
+    monkeypatch.setattr(
+        LXMF.LXMessage, "unpack_from_bytes", staticmethod(lambda _b: inbound(signed=True))
+    )
+
+    hub.retry_unverified()
+
+    history = store.group_history(GROUP)
+    assert len(history) == 1
+    assert history[0].sender_hash == ALICE
+    assert hub._unverified == []
+
+
+def test_held_message_is_dropped_once_its_hold_window_expires(tmp_path, monkeypatch):
+    config = HubConfig()
+    config.egress.unverified_hold_sec = 0.0
+    hub, store = make_hub(tmp_path, config=config)
+    store.add_member(GROUP, ALICE)
+
+    monkeypatch.setattr(RNS.Transport, "has_path", staticmethod(lambda _hash: True))
+    monkeypatch.setattr(RNS.Transport, "request_path", staticmethod(lambda _hash: None))
+    monkeypatch.setattr(RNS.Identity, "recall", staticmethod(lambda _hash: None))
+
+    held = inbound(signed=False)
+    held.unverified_reason = LXMF.LXMessage.SOURCE_UNKNOWN
+    held.packed = b"raw-lxmf-bytes"
+    hub.handle_inbound(held)
+
+    hub.retry_unverified()
+
+    assert store.group_history(GROUP) == []
+    assert hub._unverified == []
+
+
 def test_non_members_are_dropped_in_invite_groups(tmp_path):
     hub, store = make_hub(tmp_path)
     store.add_member(GROUP, BOB)
@@ -117,7 +197,6 @@ def test_non_members_are_dropped_in_invite_groups(tmp_path):
 def test_public_groups_enroll_senders(tmp_path):
     hub, store = make_hub(tmp_path, acl_mode=ACL_PUBLIC)
     store.add_member(GROUP, BOB)
-
     hub.handle_inbound(inbound(source=ALICE))
 
     assert store.get_role(GROUP, ALICE) == "member"

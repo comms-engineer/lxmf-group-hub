@@ -5,12 +5,13 @@ import time
 import pytest
 
 from lxmf_hub.personas import CODE_TTL_SEC, PersonaError, PersonaRegistry, validate_name, wins
-from lxmf_hub.store import PersonaIdentity, PersonaRecord, Store
+from lxmf_hub.store import ACL_INVITE, ROLE_ADMIN, ROLE_BANNED, PersonaIdentity, PersonaRecord, Store
 
 PHONE = b"\xa1" * 16
 LAPTOP = b"\xa2" * 16
 RADIO = b"\xa3" * 16
 STRANGER = b"\xb0" * 16
+GROUP = "ops"
 
 
 @pytest.fixture
@@ -74,6 +75,28 @@ def test_a_code_cannot_be_spent_twice(registry):
 
     with pytest.raises(PersonaError, match="not valid"):
         registry.join(RADIO, code)
+
+
+def test_joining_inherits_the_persona_s_group_membership(registry):
+    registry.claim(PHONE, "alice")
+    registry.store.create_group(GROUP, "Ops", b"\x00" * 64, acl_mode=ACL_INVITE)
+    registry.store.add_member(GROUP, PHONE, ROLE_ADMIN)
+    code, _expires_at = registry.mint_code(PHONE)
+
+    registry.join(LAPTOP, code)
+
+    assert registry.store.get_role(GROUP, LAPTOP) == ROLE_ADMIN
+
+
+def test_a_banned_device_does_not_get_its_ban_carried_onto_a_new_one(registry):
+    registry.claim(PHONE, "alice")
+    registry.store.create_group(GROUP, "Ops", b"\x00" * 64, acl_mode=ACL_INVITE)
+    registry.store.add_member(GROUP, PHONE, ROLE_BANNED)
+    code, _expires_at = registry.mint_code(PHONE)
+
+    registry.join(LAPTOP, code)
+
+    assert registry.store.get_role(GROUP, LAPTOP) is None
 
 
 def test_an_expired_code_is_refused(registry):

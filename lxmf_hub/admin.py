@@ -102,14 +102,27 @@ def build_parser() -> TextParser:
     acl.add_argument("group_id")
     acl.add_argument("acl", choices=[ACL_PUBLIC, ACL_INVITE])
 
-    add = add_command("add-member", "authorise an LXMF destination hash")
+    add = add_command("add-member", "authorise an LXMF address (not an RNS identity hash)")
     add.add_argument("group_id")
-    add.add_argument("user_hash")
+    add.add_argument(
+        "user_hash",
+        help=(
+            "the member's LXMF address, i.e. their delivery destination hash -- "
+            "the hash Sideband shows as 'Address', not the RNS 'Identity hash'. "
+            "In an invite-only group a non-member's messages are dropped before "
+            "'/whoami' could ever answer, so get this from the member's own "
+            "client (their address/identity screen) or, once admitted, from "
+            "'/whoami' or '/status'."
+        ),
+    )
     add.add_argument("--role", choices=[ROLE_MEMBER, ROLE_ADMIN, ROLE_BANNED], default=ROLE_MEMBER)
 
     remove = add_command("remove-member", "remove a member from a group")
     remove.add_argument("group_id")
-    remove.add_argument("user_hash")
+    remove.add_argument(
+        "user_hash",
+        help="the member's LXMF address, same value used for add-member",
+    )
 
     members = add_command("members", "list the members of a group")
     members.add_argument("group_id")
@@ -233,6 +246,17 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
 def user_hash(value: str) -> bytes:
     """Parse a destination hash the way an operator is likely to have copied it.
 
+    This must be the member's LXMF address (their delivery destination hash),
+    the value the hub actually checks messages against. It is not the same as
+    the RNS 'Identity hash' some clients also display: passing that in adds a
+    member the hub can never match, since it authorises against
+    ``message.source_hash`` (the delivery destination), never the identity. In
+    an invite-only group a prospective member cannot be asked to send '/whoami'
+    to fetch it: their messages are dropped before that command would ever be
+    answered, since they are not a member yet. Get the address from the
+    member's own client instead (their identity/address screen), or from
+    '/whoami'/'/status' once they are already admitted somewhere on this hub.
+
     RNS prints hashes as ``<a1b2...>`` and clients show them grouped with colons,
     so those forms are accepted rather than rejected as "not hex". The length is
     checked too: ``bytes.fromhex`` is happy with a truncated hash, which would
@@ -244,10 +268,10 @@ def user_hash(value: str) -> bytes:
     try:
         parsed = bytes.fromhex(cleaned)
     except ValueError as exception:
-        raise CommandError(f"'{value}' is not a hex destination hash") from exception
+        raise CommandError(f"'{value}' is not a hex LXMF address") from exception
     if len(parsed) != DESTINATION_HASH_LENGTH:
         raise CommandError(
-            f"'{value}' is {len(parsed)} byte(s); an LXMF destination hash is"
-            f" {DESTINATION_HASH_LENGTH} ({DESTINATION_HASH_LENGTH * 2} hex characters)"
+            f"'{value}' is {len(parsed)} byte(s); an LXMF address (delivery destination"
+            f" hash) is {DESTINATION_HASH_LENGTH} ({DESTINATION_HASH_LENGTH * 2} hex characters)"
         )
     return parsed

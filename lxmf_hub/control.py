@@ -11,6 +11,16 @@ Commands are the CLI verbs, sent as plain message text:
     add-member ops 8f1c...  ->  "8f1c... is member in ops"
     groups                  ->  one line per group with its destination hash
 
+Every hash a command takes is an LXMF address -- a delivery destination hash,
+which is what ``message.source_hash`` gives the hub for every inbound message --
+never the sender's RNS identity hash. The two are different values derived from
+the same identity, and a hub given an identity hash instead can never match it
+against anything, so the member it was meant to authorise stays a stranger. In
+an invite-only group a prospective member's messages are dropped before they
+are a member, so there is no in-band command that can hand their address back;
+it has to come from their own client (its address/identity screen), or from
+'/whoami'/'/status' once they are already admitted somewhere on this hub.
+
 State changes land in SQLite, and the daemon hot-loads them within
 ``GROUP_RELOAD_INTERVAL``, so a group created over LXMF starts announcing
 without a restart.
@@ -211,6 +221,13 @@ def operator_help(verb: str | None = None) -> str:
         lines.append(f"      {parser.summaries[name]}")
     lines.append("Send 'help <command>' for one command in detail.")
     lines.append("Hashes may be pasted as <a1b2..>, a1:b2:.. or plain hex.")
+    lines.append(
+        "add-member/remove-member want a member's LXMF address (delivery"
+        " destination hash), not their RNS identity hash. For an invite-only"
+        " group get it from the member's own client -- their address is"
+        " dropped before '/whoami' could ever answer, since they aren't a"
+        " member yet."
+    )
     return "\n".join(lines)
 
 
