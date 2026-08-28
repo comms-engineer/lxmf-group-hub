@@ -99,6 +99,9 @@ def build_parser() -> TextParser:
 
     add_command("groups", "list groups and their destination hashes")
 
+    delete = add_command("delete-group", "delete a group and all its members")
+    delete.add_argument("group_id")
+
     acl = add_command("set-acl", "change the ACL mode of a group")
     acl.add_argument("group_id")
     acl.add_argument("acl", choices=[ACL_PUBLIC, ACL_INVITE])
@@ -173,6 +176,12 @@ def administer(args: argparse.Namespace, config: HubConfig, store: Store) -> str
             members = len(store.list_members(group.group_id))
             lines.append(f"{group.group_id}\t{group.acl_mode}\t{members} member(s)\t{destination}")
         return "\n".join(lines) or "no groups"
+
+    if args.command == "delete-group":
+        if store.get_group(args.group_id) is None:
+            raise CommandError(f"No such group: {args.group_id}")
+        store.delete_group(args.group_id)
+        return f"{args.group_id} deleted"
 
     if args.command == "set-acl":
         if store.get_group(args.group_id) is None:

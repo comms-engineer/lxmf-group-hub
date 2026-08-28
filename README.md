@@ -29,6 +29,7 @@ Python 3.9 or newer, plus `rns`, `lxmf`, and `msgpack`. Development is on rns 1.
 ```bash
 lxmf-hub --config hub.json create-group ops --name "Ops" --acl invite
 lxmf-hub --config hub.json add-member ops <client_lxmf_destination_hash>
+lxmf-hub --config hub.json delete-group ops
 lxmf-hub --config hub.json run
 ```
 
@@ -44,7 +45,7 @@ pool itself is versioned in `lxmf_hub/aliases.py`.
 
 The hub itself cannot hand this value back before the member is added: in an `invite` group a non-member's messages, including a `/whoami`, are dropped before authorisation, and the operator control channel only answers senders already on its own fixed list. So collect it from the member's own client -- Sideband, NomadNet, and MeshChat all have a screen showing your own LXMF address/identity -- and only rely on the in-band `/whoami` or `/status` for someone already admitted to a `public` group or already a member elsewhere on this hub.
 
-Administration is out of band by design, because in-band commands would mean parsing text from unauthenticated senders. Groups, ACLs, and roles live in SQLite; `create-group`, `add-member`, `remove-member`, `set-acl`, `groups`, `members`, and `status` all operate on the database directly and are safe to run while the daemon is up. A running daemon rescans the `groups` table every 30 seconds and attaches anything new, so a group created at 14:02 is announcing by 14:03 without a restart.
+Administration is out of band by design, because in-band commands would mean parsing text from unauthenticated senders. Groups, ACLs, and roles live in SQLite; `create-group`, `delete-group`, `add-member`, `remove-member`, `set-acl`, `groups`, `members`, and `status` all operate on the database directly and are safe to run while the daemon is up. `delete-group` also deletes every member record for that group. A running daemon rescans the `groups` table every 30 seconds and attaches anything new, so a group created at 14:02 is announcing by 14:03 without a restart.
 
 `status` prints the group count, the egress, notice, and operator answer queue depths, and, when `operator_identity` is set, the control destination hash operators address. `operator_identity` itself takes the same kind of value as `add-member`: an operator's LXMF address, not their RNS identity hash.
 

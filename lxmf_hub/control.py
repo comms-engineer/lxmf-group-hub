@@ -44,6 +44,7 @@ REMOTE_COMMANDS = frozenset(
     {
         "create-group",
         "groups",
+        "delete-group",
         "set-acl",
         "add-member",
         "remove-member",

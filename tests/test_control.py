@@ -100,6 +100,17 @@ def test_roles_and_acl_changes_go_through(tmp_path):
     assert store.get_role("ops", bytes.fromhex(MEMBER)) is None
 
 
+def test_deleting_a_group_removes_its_members(tmp_path):
+    channel, store = make_channel(tmp_path)
+    channel.execute("create-group ops")
+    channel.execute(f"add-member ops {MEMBER}")
+
+    assert channel.execute("delete-group ops") == "ops deleted"
+    assert store.get_group("ops") is None
+    assert store.list_members("ops", include_banned=True) == []
+    assert "No such group" in channel.execute("delete-group ops")
+
+
 def test_status_reports_group_count_and_queue_depth(tmp_path):
     channel, _store = make_channel(tmp_path)
     channel.execute("create-group ops")
