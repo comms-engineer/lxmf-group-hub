@@ -9,6 +9,7 @@ from lxmf_hub.config import HubConfig
 from lxmf_hub.egress import EgressScheduler, TokenBucket
 from lxmf_hub.hub import GroupHub, pack_payload
 from lxmf_hub.store import MessageRecord, Store, message_hash
+from lxmf_hub.tickets import ScopedTickets
 from tests.test_hub import GROUP, GROUP_DESTINATION, StubDestinations
 
 AUTHOR = b"\xa1" * 16
@@ -20,6 +21,7 @@ class StubRouter:
         self.sent = []
         self.pending_outbound = []
         self.propagation_node = propagation_node
+        self.available_tickets = {"outbound": {}, "inbound": {}, "last_deliveries": {}}
 
     def get_outbound_propagation_node(self):
         return self.propagation_node
@@ -37,7 +39,7 @@ def build(tmp_path, monkeypatch, config=None, identity="known", router=None):
     destinations = StubDestinations({GROUP_DESTINATION: GROUP})
     hub = GroupHub(config, store, router=None, destinations=destinations)
     router = router or StubRouter()
-    scheduler = EgressScheduler(config, store, hub, router, destinations)
+    scheduler = EgressScheduler(config, store, hub, router, destinations, ScopedTickets())
 
     payload = pack_payload(1000.0, b"", b"hello", {})
     record = MessageRecord(
@@ -59,6 +61,8 @@ def build(tmp_path, monkeypatch, config=None, identity="known", router=None):
         hub, "build_reflection", lambda rec, ident: SimpleNamespace(
             desired_method=None,
             method=LXMF.LXMessage.DIRECT,
+            source_hash=b"\x00" * 16,
+            destination_hash=MEMBER,
             register_delivery_callback=lambda callback: None,
             register_failed_callback=lambda callback: None,
         )
@@ -465,6 +469,8 @@ class StubMessage:
     def __init__(self):
         self.desired_method = None
         self.method = LXMF.LXMessage.DIRECT
+        self.source_hash = b"\x00" * 16
+        self.destination_hash = MEMBER
         self.delivered = None
         self.failed = None
 

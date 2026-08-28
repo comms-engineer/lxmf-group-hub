@@ -17,6 +17,7 @@ from lxmf_hub.directory import DIRECTORY_GROUP, DirectoryChannel, load_directory
 from lxmf_hub.egress import EgressScheduler
 from lxmf_hub.hub import GroupHub
 from lxmf_hub.store import ACL_INVITE, ACL_PUBLIC, SOURCE_DIRECTORY, Store
+from lxmf_hub.tickets import ScopedTickets
 from tests.test_hub import StubDestinations
 
 GROUP = "ops"
@@ -31,6 +32,7 @@ class StubRouter:
         self.sent = []
         self.pending_outbound = []
         self.announced = []
+        self.available_tickets = {"outbound": {}, "inbound": {}, "last_deliveries": {}}
 
     def get_outbound_propagation_node(self):
         return None
@@ -264,6 +266,8 @@ class FakeMessage:
     def __init__(self, destination, source, content=b"", title=b"", desired_method=None):
         self.destination = destination
         self.source = source
+        self.destination_hash = getattr(destination, "hash", b"\x00" * 16)
+        self.source_hash = getattr(source, "hash", b"\x00" * 16)
         self.content = content
         self.desired_method = desired_method
         self.method = LXMF.LXMessage.DIRECT
@@ -279,7 +283,7 @@ class FakeMessage:
 def _scheduler(channel, store, router):
     hub = GroupHub(channel.config, store, router=None, destinations=StubDestinations({}))
     return EgressScheduler(
-        channel.config, store, hub, router, StubDestinations({}), directory=channel
+        channel.config, store, hub, router, StubDestinations({}), ScopedTickets(), directory=channel
     )
 
 

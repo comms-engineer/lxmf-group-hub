@@ -27,6 +27,7 @@ from .federation import FederationEngine
 from .hub import GroupHub
 from .personas import PersonaRegistry
 from .store import Store
+from .tickets import ScopedTickets
 from .usercmds import UserCommands
 
 GROUP_RELOAD_INTERVAL = 30.0
@@ -76,6 +77,7 @@ class HubDaemon:
         self.control: ControlChannel | None = None
         self.directory: DirectoryChannel | None = None
         self.failover: FailoverEngine | None = None
+        self.tickets = ScopedTickets()
         self._stop = threading.Event()
 
     # -- startup ---------------------------------------------------------
@@ -132,6 +134,7 @@ class HubDaemon:
             self.hub,
             self.router,
             self.destinations,
+            self.tickets,
             self.directory,
             self.control,
         )
@@ -157,6 +160,7 @@ class HubDaemon:
     def deliver(self, message: LXMF.LXMessage) -> None:
         """Route an inbound LXMF message to the control channel or a group."""
         try:
+            self.tickets.remember(message)
             if self.control is not None and self.control.owns(message.destination_hash):
                 self.control.handle(message)
                 return
@@ -225,6 +229,7 @@ class HubDaemon:
         # Spent and expired device codes are dead weight and, kept around, a
         # window for guessing one.
         self.store.prune_link_codes()
+        self.tickets.clean()
 
     def _signal(self, signum, frame) -> None:
         RNS.log("Shutting down hub", RNS.LOG_NOTICE)
