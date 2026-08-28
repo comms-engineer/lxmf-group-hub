@@ -298,3 +298,51 @@ def test_a_banned_sender_gets_no_command_answer(tmp_path):
     hub.handle_inbound(inbound(source=ALICE, content=b"/status"))
 
     assert store.user_depth() == 0
+
+
+def invite_command_hub(tmp_path):
+    config = HubConfig()
+    config.commands.min_reply_interval_sec = 0.0
+    hub, store = make_hub(tmp_path, acl_mode=ACL_INVITE, config=config)
+    hub.commands = UserCommands(config, store, PersonaRegistry(store), hub.destinations)
+    return hub, store
+
+
+def test_a_valid_link_code_admits_a_stranger_in_an_invite_only_group(tmp_path):
+    hub, store = invite_command_hub(tmp_path)
+    store.add_member(GROUP, ALICE)
+    code, _expires_at = PersonaRegistry(store).mint_code(ALICE)
+
+    hub.handle_inbound(inbound(source=BOB, content=f"/link {code}".encode()))
+
+    assert store.get_role(GROUP, BOB) == "member"
+    assert store.group_history(GROUP) == []
+    assert store.user_depth() == 1
+
+
+def test_an_invalid_link_code_is_answered_but_admits_nobody(tmp_path):
+    hub, store = invite_command_hub(tmp_path)
+
+    hub.handle_inbound(inbound(source=BOB, content=b"/link ZZZZZZ"))
+
+    assert store.get_role(GROUP, BOB) is None
+    assert store.user_depth() == 1
+
+
+def test_unauthorised_senders_get_no_answer_for_any_other_command(tmp_path):
+    hub, store = invite_command_hub(tmp_path)
+
+    hub.handle_inbound(inbound(source=ALICE, content=b"/status"))
+
+    assert store.get_role(GROUP, ALICE) is None
+    assert store.group_history(GROUP) == []
+    assert store.user_depth() == 0
+
+
+def test_bare_link_from_a_stranger_is_dropped_not_treated_as_a_code_request(tmp_path):
+    hub, store = invite_command_hub(tmp_path)
+
+    hub.handle_inbound(inbound(source=ALICE, content=b"/link"))
+
+    assert store.get_role(GROUP, ALICE) is None
+    assert store.user_depth() == 0

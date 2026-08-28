@@ -102,18 +102,31 @@ class UserCommands:
 
     # -- dispatch --------------------------------------------------------
 
-    def handle(self, group_id: str, sender_hash: bytes, text: str) -> bool:
+    def handle(
+        self, group_id: str, sender_hash: bytes, text: str, authorised: bool = True
+    ) -> bool:
         """Take a command off a group.
 
         Returns whether the message was a command, which is what tells the hub not
         to reflect it. A command that arrives inside the per-sender interval is
         still a command and is still swallowed -- otherwise a member hammering
         '/status' would see the flood land in the group as ordinary messages.
+
+        ``authorised`` is False for a sender the group ACL hasn't accepted yet.
+        A stranger gets exactly one verb: '/link <code>'. The code, minted by a
+        device already in the group, is what does the authorising -- everything
+        else is refused here, unanswered, so '/status', '/who' and the rest
+        can't be used to read group state before the hub has accepted anything
+        from that hash.
         """
         if not self.config.commands.enabled:
             return False
         verb = verb_of(text)
         if verb is None:
+            return False
+        if not authorised and (
+            verb != VERB_LINK or len(text.strip().split(maxsplit=1)) < 2
+        ):
             return False
         now = time.time()
         last = self._answered.get(sender_hash, 0.0)

@@ -149,6 +149,22 @@ class GroupHub:
             return
 
         if not self.authorise(group, message.source_hash):
+            # The ACL didn't accept this hash, but a '/link <code>' is its own
+            # proof of authorisation: the code was minted by a device already
+            # in this persona, so joining is just catching up the ACL to what
+            # personas.py already decided. Every other verb still falls through
+            # and is dropped, unanswered, exactly as before.
+            if self.commands is not None and self.commands.handle(
+                group_id,
+                message.source_hash,
+                _message_text(message.content),
+                authorised=False,
+            ):
+                RNS.log(
+                    f"Admitted {RNS.prettyhexrep(message.source_hash)} into group"
+                    f" '{group_id}' via link code",
+                    RNS.LOG_INFO,
+                )
             return
 
         # A command is answered instead of being reflected, so the group does not
