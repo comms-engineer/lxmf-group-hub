@@ -5,7 +5,14 @@ import time
 import pytest
 
 from lxmf_hub.personas import CODE_TTL_SEC, PersonaError, PersonaRegistry, validate_name, wins
-from lxmf_hub.store import ACL_INVITE, ROLE_ADMIN, ROLE_BANNED, PersonaIdentity, PersonaRecord, Store
+from lxmf_hub.store import (
+    ACL_INVITE,
+    ROLE_ADMIN,
+    ROLE_BANNED,
+    PersonaIdentity,
+    PersonaRecord,
+    Store,
+)
 
 PHONE = b"\xa1" * 16
 LAPTOP = b"\xa2" * 16
