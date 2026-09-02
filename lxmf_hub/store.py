@@ -218,6 +218,15 @@ CREATE TABLE IF NOT EXISTS persona_links (
     expires_at REAL NOT NULL
 );
 
+-- One-time codes a member mints to let another of their existing devices unlink
+-- itself. Deliberately local for the same reason as persona_links.
+CREATE TABLE IF NOT EXISTS persona_unlinks (
+    code       TEXT PRIMARY KEY,
+    persona_id BLOB NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -1314,10 +1323,48 @@ class Store:
             return None
         return row["persona_id"]
 
+    def create_unlink_code(self, code: str, persona_id: bytes, expires_at: float) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO persona_unlinks (code, persona_id, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (code) DO UPDATE SET"
+                " persona_id = excluded.persona_id, created_at = excluded.created_at,"
+                " expires_at = excluded.expires_at",
+                (code, persona_id, time.time(), expires_at),
+            )
+            self._db.commit()
+
+    def claim_unlink_code(self, code: str, now: float | None = None) -> bytes | None:
+        now = time.time() if now is None else now
+        with self._lock:
+            try:
+                row = self._db.execute(
+                    "SELECT persona_id, expires_at FROM persona_unlinks WHERE code = ?", (code,)
+                ).fetchone()
+                if row is None:
+                    self._db.commit()
+                    return None
+                self._db.execute("DELETE FROM persona_unlinks WHERE code = ?", (code,))
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        if row["expires_at"] < now:
+            return None
+        return row["persona_id"]
+
     def prune_link_codes(self, now: float | None = None) -> int:
         now = time.time() if now is None else now
         with self._lock:
             cursor = self._db.execute("DELETE FROM persona_links WHERE expires_at < ?", (now,))
+            self._db.commit()
+        return cursor.rowcount
+
+    def prune_unlink_codes(self, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        with self._lock:
+            cursor = self._db.execute("DELETE FROM persona_unlinks WHERE expires_at < ?", (now,))
             self._db.commit()
         return cursor.rowcount
 

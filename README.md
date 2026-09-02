@@ -281,12 +281,14 @@ A username belongs to a persona, not to a destination hash, because one person i
 /whoami            ->  alice (persona 9c2f...)
                          8f1c0d7a...  <- this device
                          b3e07741...
+/unlink            ->  Send '/unlink 9X7M2R' from the device to remove within 15m. The code works once.
+/unlink 9X7M2R     ->  This device is no longer alice, 1 device(s) left.
 /unlink b3e07741   ->  b3e07741... is no longer alice, 1 device(s) left.
 ```
 
 Names are unique per federation, compared with `str.casefold()` and displayed as typed, so `Alice` and `alice` are one name and the capitalisation the owner chose survives. A device belongs to at most one persona at a time, and the last device of a named persona can't be unlinked, since a name nobody can post under is a name nobody can release either.
 
-Link codes never leave the hub that minted them. They are six characters from an alphabet with no `0/O` or `1/I`, single-use, and expire in 15 minutes; the second device proves nothing but possession of the code, which is the same trust model as pairing a device by reading a number off a screen.
+Link and unlink codes never leave the hub that minted them. They are six characters from an alphabet with no `0/O` or `1/I`, single-use, and expire in 15 minutes; the second device proves nothing but possession of the code, which is the same trust model as pairing a device by reading a number off a screen.
 
 Linking a device also carries over whatever groups the persona already belongs to: the new device gets the same role (member or admin, never a ban) in every group where an existing device of that persona has one, so a member adding their laptop to an invite-only group they're already in doesn't need the operator to `/add-member` it by hand. Membership on the linking device's own hash is untouched by this -- unlink drops the roles it was given the same way any member's departure would, via `/remove-member`.
 

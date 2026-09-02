@@ -229,6 +229,7 @@ class HubDaemon:
         # Spent and expired device codes are dead weight and, kept around, a
         # window for guessing one.
         self.store.prune_link_codes()
+        self.store.prune_unlink_codes()
         self.tickets.clean()
 
     def _signal(self, signum, frame) -> None:

@@ -30,7 +30,7 @@ from .config import HubConfig
 from .control import operator_help
 from .destinations import VirtualDestinationManager, group_destination_hash
 from .failover import effective_peer_timeout, format_age
-from .personas import PersonaError, PersonaRegistry
+from .personas import CODE_ALPHABET, CODE_LENGTH, PersonaError, PersonaRegistry
 from .store import ROLE_ADMIN, ROLE_BANNED, ROLE_MEMBER, Store
 
 VERB_HELP = "/help"
@@ -49,7 +49,9 @@ USAGE = (
     (VERB_WHOAMI, "your username, devices, and the LXMF address to give an admin"),
     (VERB_LINK, "get a one-time code to add another device"),
     (f"{VERB_LINK} <code>", "join this device to that persona"),
+    (VERB_UNLINK, "get a one-time code another of your devices can spend to unlink itself"),
     (f"{VERB_UNLINK} <hash>", "drop one of your own devices"),
+    (f"{VERB_UNLINK} <code>", "spend an unlink code from this device"),
     (f"{VERB_WHO} <username>", "which devices a username is"),
     (VERB_NAMES, "usernames known to this hub"),
     ("/add <hash>", "admin: add a member to this group"),
@@ -426,7 +428,19 @@ class UserCommands:
 
     def _unlink(self, sender_hash: bytes, argument: str | None) -> str:
         if argument is None:
-            return f"Send '{VERB_UNLINK} <hash>' with the device to drop."
+            code, expires_at = self.registry.mint_unlink_code(sender_hash)
+            return (
+                f"Send '{VERB_UNLINK} {code}' from the device to remove within"
+                f" {format_age(expires_at - time.time())}."
+                " The code works once."
+            )
+        if _looks_like_code(argument):
+            persona = self.registry.unlink_with_code(sender_hash, argument)
+            devices = self.registry.devices(persona.persona_id)
+            return (
+                f"This device is no longer {persona.name or 'your persona'},"
+                f" {len(devices)} device(s) left."
+            )
         target = _device_hash(argument)
         persona = self.registry.unlink(sender_hash, target)
         devices = self.registry.devices(persona.persona_id)
@@ -500,3 +514,8 @@ def _device_hash(value: str) -> bytes:
         return user_hash(value)
     except CommandError as exception:
         raise PersonaError(str(exception)) from exception
+
+
+def _looks_like_code(value: str) -> bool:
+    trimmed = value.strip().upper()
+    return len(trimmed) == CODE_LENGTH and all(char in CODE_ALPHABET for char in trimmed)

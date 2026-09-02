@@ -155,6 +155,28 @@ class PersonaRegistry:
             self.store.add_member(group_id, user_hash, role)
         return persona
 
+    def mint_unlink_code(self, user_hash: bytes) -> tuple[str, float]:
+        """Mint a one-time code another of this persona's devices can spend to unlink itself."""
+        persona = self.persona_for(user_hash)
+        if persona is None:
+            raise PersonaError("You have no persona to unlink anything from.")
+        if len(self.store.persona_devices(persona.persona_id)) == 1:
+            raise PersonaError("You only have one device on this persona.")
+        expires_at = time.time() + CODE_TTL_SEC
+        code = new_code()
+        self.store.create_unlink_code(code, persona.persona_id, expires_at)
+        return code, expires_at
+
+    def unlink_with_code(self, user_hash: bytes, code: str) -> PersonaRecord:
+        """Spend an unlink code to remove this device from its persona."""
+        persona_id = self.store.claim_unlink_code(code.strip().upper())
+        if persona_id is None:
+            raise PersonaError("That code is not valid. Codes are single-use and expire.")
+        mine = self.persona_for(user_hash)
+        if mine is None or mine.persona_id != persona_id:
+            raise PersonaError("That code is not for this device.")
+        return self.unlink(user_hash, user_hash)
+
     def unlink(self, user_hash: bytes, target_hash: bytes) -> PersonaRecord:
         """Detach one of the caller's own devices from their persona."""
         mine = self.persona_for(user_hash)
