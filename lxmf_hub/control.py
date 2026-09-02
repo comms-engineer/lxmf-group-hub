@@ -6,10 +6,11 @@ and it accepts commands from the hashes in ``operator_identity`` and nobody else
 Authorisation is the Ed25519 signature RNS verified while unpacking the message,
 so there is no password, token or session to steal.
 
-Commands are the CLI verbs, sent as plain message text:
+Commands are the CLI verbs, slash-prefixed the same way a member's in-band
+commands are, sent as plain message text:
 
-    add-member ops 8f1c...  ->  "8f1c... is member in ops"
-    groups                  ->  one line per group with its destination hash
+    /add-member ops 8f1c...  ->  "8f1c... is member in ops"
+    /groups                  ->  one line per group with its destination hash
 
 Every hash a command takes is an LXMF address -- a delivery destination hash,
 which is what ``message.source_hash`` gives the hub for every inbound message --
@@ -56,7 +57,7 @@ REMOTE_COMMANDS = frozenset(
     }
 )
 
-HELP_TOKENS = frozenset({"help", "-h", "--help", "?"})
+HELP_TOKENS = frozenset({"/help", "-h", "--help", "?"})
 
 # An operator types a command on a phone keyboard, so a stray autocapitalised
 # verb or a smart-quoted hash is a typing artefact rather than a different
@@ -169,7 +170,16 @@ class ControlChannel:
         if not tokens or tokens[0].lower() in HELP_TOKENS:
             return self.help(tokens[1] if len(tokens) > 1 else None)
 
-        verb = tokens[0].lower()
+        # Operator commands are slash-prefixed, the same as a member's in-band
+        # commands, so the two surfaces read the same way to anyone watching
+        # over an operator's shoulder.
+        raw = tokens[0].lower()
+        if not raw.startswith("/"):
+            return (
+                f"'{tokens[0]}' is not an operator command. Operator commands"
+                f" start with '/', for example '/status'.\n\n{self.help()}"
+            )
+        verb = raw[1:]
         if verb not in REMOTE_COMMANDS:
             return f"'{tokens[0]}' is not an operator command.\n\n{self.help()}"
         if len(tokens) > 1 and tokens[1].lower() in HELP_TOKENS:
@@ -303,18 +313,20 @@ def operator_help(verb: str | None = None) -> str:
     Module level because an operator also asks for it with ``/help`` inside a
     group, where there is no control channel instance to ask.
     """
-    if verb is not None and verb.lower() in REMOTE_COMMANDS:
-        return build_parser().subcommands[verb.lower()].format_help().strip()
+    if verb is not None:
+        verb = verb.lower().lstrip("/")
+    if verb is not None and verb in REMOTE_COMMANDS:
+        return build_parser().subcommands[verb].format_help().strip()
 
     parser = build_parser()
     lines = ["Commands:"]
     for name in sorted(REMOTE_COMMANDS):
-        lines.append(f"  {command_usage(name)}")
+        lines.append(f"  /{command_usage(name)}")
         lines.append(f"      {parser.summaries[name]}")
-    lines.append("Send 'help <command>' for one command in detail.")
+    lines.append("Send '/help <command>' for one command in detail.")
     lines.append("Hashes may be pasted as <a1b2..>, a1:b2:.. or plain hex.")
     lines.append(
-        "add-member/remove-member want a member's LXMF address (delivery"
+        "'/add-member'/'/remove-member' want a member's LXMF address (delivery"
         " destination hash), not their RNS identity hash. For an invite-only"
         " group get it from the member's own client -- their address is"
         " dropped before '/whoami' could ever answer, since they aren't a"

@@ -31,7 +31,7 @@ from .control import operator_help
 from .destinations import VirtualDestinationManager, group_destination_hash
 from .failover import effective_peer_timeout, format_age
 from .personas import PersonaError, PersonaRegistry
-from .store import Store
+from .store import ROLE_ADMIN, ROLE_BANNED, ROLE_MEMBER, Store
 
 VERB_HELP = "/help"
 VERB_STATUS = "/status"
@@ -52,6 +52,10 @@ USAGE = (
     (f"{VERB_UNLINK} <hash>", "drop one of your own devices"),
     (f"{VERB_WHO} <username>", "which devices a username is"),
     (VERB_NAMES, "usernames known to this hub"),
+    ("/add <hash>", "admin: add a member to this group"),
+    ("/remove <hash>", "admin: remove a member from this group"),
+    ("/ban <hash>", "admin: ban a member from this group"),
+    ("/unban <hash>", "admin: restore a banned member"),
 )
 
 VERBS = frozenset(
@@ -64,6 +68,10 @@ VERBS = frozenset(
         VERB_UNLINK,
         VERB_WHO,
         VERB_NAMES,
+        "/add",
+        "/remove",
+        "/ban",
+        "/unban",
     }
 )
 
@@ -103,7 +111,12 @@ class UserCommands:
     # -- dispatch --------------------------------------------------------
 
     def handle(
-        self, group_id: str, sender_hash: bytes, text: str, authorised: bool = True
+        self,
+        group_id: str,
+        sender_hash: bytes,
+        text: str,
+        authorised: bool = True,
+        role: str | None = None,
     ) -> bool:
         """Take a command off a group.
 
@@ -138,7 +151,9 @@ class UserCommands:
             return True
         self._prune_senders(now)
         self._answered[sender_hash] = now
-        self.store.enqueue_user(group_id, sender_hash, self.execute(sender_hash, text))
+        self.store.enqueue_user(
+            group_id, sender_hash, self.execute(sender_hash, text, group_id, role)
+        )
         return True
 
     def _prune_senders(self, now: float) -> None:
@@ -148,7 +163,13 @@ class UserCommands:
             sender: when for sender, when in self._answered.items() if now - when < interval
         }
 
-    def execute(self, sender_hash: bytes, text: str) -> str:
+    def execute(
+        self,
+        sender_hash: bytes,
+        text: str,
+        group_id: str | None = None,
+        role: str | None = None,
+    ) -> str:
         """Run one command and return the text to answer with.
 
         Every path returns text, including every failure: a member with no answer
@@ -174,6 +195,8 @@ class UserCommands:
                 return self._who(argument)
             if verb == VERB_NAMES:
                 return self._names()
+            if verb in {"/add", "/remove", "/ban", "/unban"}:
+                return self._moderate(group_id, sender_hash, role, verb, argument)
         except PersonaError as exception:
             return str(exception)
         except Exception as exception:
@@ -181,6 +204,42 @@ class UserCommands:
             RNS.trace_exception(exception)
             return f"That command failed: {exception}"
         return self.help(sender_hash)
+
+    def _moderate(
+        self,
+        group_id: str | None,
+        sender_hash: bytes,
+        role: str | None,
+        verb: str,
+        argument: str | None,
+    ) -> str:
+        if role != ROLE_ADMIN or group_id is None:
+            return "Only a group admin can use that command."
+        if argument is None:
+            return f"Usage: {verb} <hash>"
+        target = user_hash(argument)
+        if target == sender_hash:
+            return "You cannot remove or ban yourself."
+        target_role = self.store.get_role(group_id, target)
+        if verb == "/add":
+            if target_role == ROLE_ADMIN:
+                return f"{target.hex()} is already an admin in {group_id}"
+            self.store.add_member(group_id, target, ROLE_MEMBER)
+            return f"{target.hex()} is now a member in {group_id}"
+        if target_role == ROLE_ADMIN:
+            return "Only the operator can change another admin."
+        if verb == "/remove":
+            if target_role is None:
+                return f"{target.hex()} is not a member of {group_id}"
+            self.store.remove_member(group_id, target)
+            return f"{target.hex()} removed from {group_id}"
+        if verb == "/ban":
+            self.store.add_member(group_id, target, ROLE_BANNED)
+            return f"{target.hex()} is now banned in {group_id}"
+        if target_role != ROLE_BANNED:
+            return f"{target.hex()} is not banned in {group_id}"
+        self.store.add_member(group_id, target, ROLE_MEMBER)
+        return f"{target.hex()} is no longer banned in {group_id}"
 
     # -- help ------------------------------------------------------------
 

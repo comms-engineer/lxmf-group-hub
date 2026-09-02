@@ -4,7 +4,7 @@ import pytest
 
 from lxmf_hub.config import HubConfig
 from lxmf_hub.personas import PersonaRegistry
-from lxmf_hub.store import ACL_PUBLIC, Store
+from lxmf_hub.store import ACL_PUBLIC, ROLE_ADMIN, ROLE_BANNED, Store
 from lxmf_hub.usercmds import UserCommands, verb_of
 from tests.test_hub import GROUP, GROUP_DESTINATION, StubDestinations
 
@@ -61,6 +61,28 @@ def test_a_command_is_swallowed_and_answered(commands):
 
     assert commands.store.user_depth() == 1
     assert commands.store.display_name_for(ALICE) == "alice"
+
+
+def test_a_member_cannot_moderate_the_group(commands):
+    assert commands.handle(GROUP, ALICE, f"/ban {LAPTOP.hex()}", role="member") is True
+
+    assert commands.store.get_role(GROUP, LAPTOP) is None
+    assert "Only a group admin" in answers(commands)[0]
+
+
+def test_an_admin_can_manage_members_but_not_another_admin(commands):
+    commands.store.add_member(GROUP, ALICE, ROLE_ADMIN)
+
+    assert commands.handle(GROUP, ALICE, f"/ban {LAPTOP.hex()}", role=ROLE_ADMIN) is True
+    assert commands.store.get_role(GROUP, LAPTOP) == ROLE_BANNED
+    assert "banned" in answers(commands)[0]
+
+    commands.handle(GROUP, ALICE, f"/unban {LAPTOP.hex()}", role=ROLE_ADMIN)
+    assert commands.store.get_role(GROUP, LAPTOP) == "member"
+
+    commands.store.add_member(GROUP, LAPTOP, ROLE_ADMIN)
+    commands.handle(GROUP, ALICE, f"/remove {LAPTOP.hex()}", role=ROLE_ADMIN)
+    assert commands.store.get_role(GROUP, LAPTOP) == ROLE_ADMIN
 
 
 def test_a_repeat_inside_the_interval_is_swallowed_without_an_answer(commands):

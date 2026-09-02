@@ -2,7 +2,7 @@
 
 A headless group chat server for the [Reticulum Network Stack](https://reticulum.network). Each group gets its own RNS identity and its own inbound LXMF delivery destination, announced on a 30 minute interval, so Sideband, NomadNet, and MeshChat see a group as an ordinary contact in their address book. A member sends a normal LXMF message to that destination. The hub verifies the Ed25519 signature RNS already checked while unpacking the message, stores it once, and reflects it to the rest of the group.
 
-No slash commands. No bot syntax. No client patches. Group membership is a list of LXMF destination hashes in a SQLite table, and the only thing that decides whether a message is accepted is whose key signed it.
+No client patches. Group membership is a list of LXMF destination hashes in a SQLite table, and the only thing that decides whether a message is accepted is whose key signed it. Everything a member or operator asks the hub for is a `/`-prefixed command; everything else is an ordinary message reflected as-is.
 
 ## Message path
 
@@ -51,7 +51,7 @@ Administration is out of band by design, because in-band commands would mean par
 
 Destination hashes are accepted in the shapes clients and RNS actually print them: `<8f1c0d7a...>`, `8f:1c:0d:7a:...`, `0x8f1c...`, or plain hex. A hash of the wrong length is refused rather than stored, since `bytes.fromhex` accepts a truncated paste happily and a member nothing can ever match looks exactly like a member who is offline.
 
-Two ACL modes exist. In an `invite` group, a message from a hash that isn't in `members` is logged and dropped. In a `public` group, the first signed message from an unknown hash enrolls that sender as `member`. Roles are `member`, `admin`, and `banned`; a `banned` hash can't post and is skipped during fan-out, so banning takes effect on the next message rather than at the next restart.
+Two ACL modes exist. In an `invite` group, a message from a hash that isn't in `members` is logged and dropped. In a `public` group, the first signed message from an unknown hash enrolls that sender as `member`. Roles are `member`, `admin`, and `banned`; a `banned` hash can't post and is skipped during fan-out, so banning takes effect on the next message rather than at the next restart. An admin can moderate their group from an ordinary client with `/add <hash>`, `/remove <hash>`, `/ban <hash>`, and `/unban <hash>`. These commands are group-scoped; only the operator can assign admins or change another admin.
 
 ## Configuration
 
@@ -116,28 +116,28 @@ Unknown keys raise `ValueError` at load time instead of being ignored, so a typo
 
 ## Operator control over LXMF
 
-`operator_identity` takes an LXMF destination hash, or a list of them, and brings up a control destination on the hub identity. It's a separate destination from every group, so group traffic never carries commands and members never see an admin surface. Authorisation is the same Ed25519 signature check the group path uses, against a fixed list of hashes. No password, no token, no session.
+`operator_identity` takes an LXMF destination hash, or a list of them, and brings up a control destination on the hub identity. It's a separate destination from every group, so group traffic never carries operator commands and ordinary members never see the hub-wide admin surface. Group admins have the separate, group-scoped moderation commands described above. Authorisation is the same Ed25519 signature check the group path uses, against a fixed list of hashes. No password, no token, no session.
 
-As with `add-member`, this is the operator's LXMF address (their own delivery destination hash), not their RNS identity hash. Get it from the operator's own client, or from `/whoami`/`/status` if they are already a member of a group on this hub -- the control destination itself won't answer them until `operator_identity` already contains their address.
+As with `/add-member`, this is the operator's LXMF address (their own delivery destination hash), not their RNS identity hash. Get it from the operator's own client, or from `/whoami`/`/status` if they are already a member of a group on this hub -- the control destination itself won't answer them until `operator_identity` already contains their address.
 
 ```json
 { "operator_identity": ["8f1c0d7a4b2e6f9081c3d5a7b9e1f3c5"] }
 ```
 
-Commands are the CLI verbs, sent as ordinary message text from an allowed hash:
+Commands are the CLI verbs, slash-prefixed the same way a member's in-band commands are, sent as ordinary message text from an allowed hash:
 
 ```
-groups                          ->  ops   invite   3 member(s)   b196e0eb...
-create-group nets --acl public  ->  nets  public   7d41c9a2...
-add-member ops 8f1c0d7a...      ->  8f1c0d7a... is member in ops
-status                          ->  groups 2, egress_queue 0, notice_queue 0, control_queue 0, control 707a7f49...
-peers                           ->  9d2f0c81... last answered 4m ago   3 member(s) known
-                                      ops   Standby Hub   7d41c9a2...
+/groups                          ->  ops   invite   3 member(s)   b196e0eb...
+/create-group nets --acl public  ->  nets  public   7d41c9a2...
+/add-member ops 8f1c0d7a...      ->  8f1c0d7a... is member in ops
+/status                          ->  groups 2, egress_queue 0, notice_queue 0, control_queue 0, control 707a7f49...
+/peers                           ->  9d2f0c81... last answered 4m ago   3 member(s) known
+                                       ops   Standby Hub   7d41c9a2...
 ```
 
-`create-group`, `groups`, `set-acl`, `add-member`, `remove-member`, `members`, `status`, and `peers` are reachable. `run` is not, and anything outside that set comes back as a list of what is. Argument errors, unknown groups, and malformed hashes are answered as text instead of raising, because there's no terminal on the other end to read a traceback. Commands write to SQLite and the daemon hot-loads them, so a group created from a phone is announcing within 30 seconds.
+`/create-group`, `/groups`, `/set-acl`, `/add-member`, `/remove-member`, `/members`, `/status`, and `/peers` are reachable. `run` is not, and anything outside that set comes back as a list of what is. Argument errors, unknown groups, and malformed hashes are answered as text instead of raising, because there's no terminal on the other end to read a traceback. Commands write to SQLite and the daemon hot-loads them, so a group created from a phone is announcing within 30 seconds.
 
-The command line is read the way a phone produces it: the verb is case-insensitive, smart quotes are folded back to plain ones before parsing, and a line over 4096 bytes is refused. `help` lists every reachable verb with the usage argparse itself prints, and `help <command>` or `<command> --help` gives one command in full, so the help can't drift from the arguments the parser accepts.
+The command line is read the way a phone produces it: the verb is case-insensitive, smart quotes are folded back to plain ones before parsing, and a line over 4096 bytes is refused. `/help` lists every reachable verb with the usage argparse itself prints, and `/help <command>` or `<command> --help` gives one command in full, so the help can't drift from the arguments the parser accepts.
 
 A message on the control destination from a hash that isn't an operator, or one whose signature didn't validate, is logged at notice level and dropped with no reply. Answers are queued in `control_queue` and drained by the egress scheduler ahead of client traffic, without spending client tokens: an answer to a command that has already changed the database is worth the same retries, path requests, and restart survival as a reflection, and dropping it because the operator's path happened to be unknown that second is what makes the control channel look dead while it is working. Two identical answers are two rows, unlike notices, because two `status` commands deserve two replies.
 
@@ -288,7 +288,7 @@ Names are unique per federation, compared with `str.casefold()` and displayed as
 
 Link codes never leave the hub that minted them. They are six characters from an alphabet with no `0/O` or `1/I`, single-use, and expire in 15 minutes; the second device proves nothing but possession of the code, which is the same trust model as pairing a device by reading a number off a screen.
 
-Linking a device also carries over whatever groups the persona already belongs to: the new device gets the same role (member or admin, never a ban) in every group where an existing device of that persona has one, so a member adding their laptop to an invite-only group they're already in doesn't need the operator to `add-member` it by hand. Membership on the linking device's own hash is untouched by this -- unlink drops the roles it was given the same way any member's departure would, via `remove-member`.
+Linking a device also carries over whatever groups the persona already belongs to: the new device gets the same role (member or admin, never a ban) in every group where an existing device of that persona has one, so a member adding their laptop to an invite-only group they're already in doesn't need the operator to `/add-member` it by hand. Membership on the linking device's own hash is untouched by this -- unlink drops the roles it was given the same way any member's departure would, via `/remove-member`.
 
 Every sync round also runs `/fed/personas`, which returns the persona rows and the device rows, tombstones included. A tombstone is why an unlink sticks: a peer that still remembers the link would otherwise re-add the device on the next round, and "my old phone keeps posting as me" is not a bug a member can work around. Rows merge on `(revision, updated_at)`, and the exchange is wrapped so a peer that doesn't answer the path -- an older hub -- costs nothing but a log line while message reconciliation continues.
 

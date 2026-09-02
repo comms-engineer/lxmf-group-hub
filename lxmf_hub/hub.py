@@ -171,7 +171,10 @@ class GroupHub:
         # see one member's '/status'. Only the known verbs are taken: anything
         # else beginning with a slash is a message and is posted as one.
         if self.commands is not None and self.commands.handle(
-            group_id, message.source_hash, _message_text(message.content)
+            group_id,
+            message.source_hash,
+            _message_text(message.content),
+            role=self.store.get_role(group_id, message.source_hash),
         ):
             RNS.log(
                 f"Answered command from {RNS.prettyhexrep(message.source_hash)}"
