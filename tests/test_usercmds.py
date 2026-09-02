@@ -162,6 +162,18 @@ def test_link_hands_out_a_code_that_the_other_device_uses(commands):
     assert commands.store.display_name_for(LAPTOP) == "alice"
 
 
+def test_unlink_hands_out_a_code_that_that_device_can_spend(commands):
+    commands.registry.claim(ALICE, "alice")
+    code, _expires_at = commands.registry.mint_code(ALICE)
+    commands.registry.join(LAPTOP, code)
+
+    offer = commands.execute(ALICE, "/unlink")
+    unlink_code = offer.split("'")[1].split()[1]
+
+    assert "no longer alice" in commands.execute(LAPTOP, f"/unlink {unlink_code}")
+    assert commands.store.display_name_for(LAPTOP) is None
+
+
 def test_who_and_names_report_the_directory(commands):
     commands.registry.claim(ALICE, "alice")
 

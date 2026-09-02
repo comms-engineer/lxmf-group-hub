@@ -5,7 +5,14 @@ import time
 import pytest
 
 from lxmf_hub.personas import CODE_TTL_SEC, PersonaError, PersonaRegistry, validate_name, wins
-from lxmf_hub.store import ACL_INVITE, ROLE_ADMIN, ROLE_BANNED, PersonaIdentity, PersonaRecord, Store
+from lxmf_hub.store import (
+    ACL_INVITE,
+    ROLE_ADMIN,
+    ROLE_BANNED,
+    PersonaIdentity,
+    PersonaRecord,
+    Store,
+)
 
 PHONE = b"\xa1" * 16
 LAPTOP = b"\xa2" * 16
@@ -128,6 +135,40 @@ def test_unlinking_leaves_a_tombstone(registry):
     assert [device.user_hash for device in registry.devices(persona.persona_id)] == [PHONE]
     tombstone = registry.store.get_persona_identity(LAPTOP)
     assert tombstone.removed_at is not None and not tombstone.active
+
+
+def test_an_unlink_code_lets_that_device_unlink_itself(registry):
+    persona = registry.claim(PHONE, "alice")
+    code, _expires_at = registry.mint_code(PHONE)
+    registry.join(LAPTOP, code)
+    unlink_code, expires_at = registry.mint_unlink_code(PHONE)
+
+    unlinked = registry.unlink_with_code(LAPTOP, unlink_code.lower())
+
+    assert unlinked.persona_id == persona.persona_id
+    assert registry.display_name(LAPTOP) is None
+    assert [device.user_hash for device in registry.devices(persona.persona_id)] == [PHONE]
+    assert expires_at == pytest.approx(time.time() + CODE_TTL_SEC, abs=5.0)
+
+
+def test_an_unlink_code_for_a_persona_cannot_unlink_another_device(registry):
+    registry.claim(PHONE, "alice")
+    code, _expires_at = registry.mint_code(PHONE)
+    registry.join(LAPTOP, code)
+    unlink_code, _expires_at = registry.mint_unlink_code(PHONE)
+
+    with pytest.raises(PersonaError, match="not for this device"):
+        registry.unlink_with_code(STRANGER, unlink_code)
+
+
+def test_an_expired_unlink_code_is_refused(registry):
+    persona = registry.claim(PHONE, "alice")
+    code, _expires_at = registry.mint_code(PHONE)
+    registry.join(LAPTOP, code)
+    registry.store.create_unlink_code("EXPIRE", persona.persona_id, expires_at=0.0)
+
+    with pytest.raises(PersonaError, match="not valid"):
+        registry.unlink_with_code(LAPTOP, "EXPIRE")
 
 
 def test_the_last_device_cannot_unlink_itself(registry):
